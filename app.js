@@ -475,19 +475,23 @@ function currentPaceMultiplier(simTime) {
   return paceMultiplierAt(playState.paceProfile, simTime);
 }
 
-/* ---- uniform stage duration: normalize a leg's (or a whole single trip's) real length to one target wall-clock duration ---- */
-const UNIFORM_TARGET_MS = 20000;
-function clampSpeed(v) {
-  return Math.min(5000, Math.max(1, v));
+/* ---- uniform stage duration: normalize a leg's (or a whole single trip's) real length to one target wall-clock duration ----
+ * Capped well below the general speed range: a very long leg (e.g. a multi-hour flight) would
+ * otherwise need a huge multiplier to fit the target duration, moving faster than map tiles can
+ * load. Past the cap it just takes a bit longer than the target instead of breaking the map. */
+const UNIFORM_TARGET_MS = 35000;
+const UNIFORM_MAX_SPEED = 150;
+function clampUniformSpeed(v) {
+  return Math.min(UNIFORM_MAX_SPEED, Math.max(1, v));
 }
 function currentBaseSpeed(simTime) {
   if (!uniformModeEnabled) return playState.speed;
   if (currentHoliday) {
     const leg = legAtSimTime(simTime);
-    if (leg) return clampSpeed((leg.synthEnd - leg.synthStart) / UNIFORM_TARGET_MS);
+    if (leg) return clampUniformSpeed((leg.synthEnd - leg.synthStart) / UNIFORM_TARGET_MS);
     return playState.speed; // in the gap between legs — no single stage to normalize to
   }
-  return clampSpeed(playState.maxMs / UNIFORM_TARGET_MS);
+  return clampUniformSpeed(playState.maxMs / UNIFORM_TARGET_MS);
 }
 
 function setupPlaybackMap(legsForGhost) {
@@ -528,10 +532,10 @@ function computeTargetZoom(pos, aheadPos) {
   const spanMeters = Math.max(30, haversine(pos, aheadPos));
   const size = playbackMap.getSize ? playbackMap.getSize() : { x: 360, y: 640 };
   const minDim = Math.max(100, Math.min(size.x, size.y));
-  const metersPerPixel = spanMeters / (minDim * 0.3);
+  const metersPerPixel = spanMeters / (minDim * 0.22);
   const latRad = (pos.lat * Math.PI) / 180;
   const zoom = Math.log2((156543.03392 * Math.cos(latRad)) / metersPerPixel);
-  return Math.min(16, Math.max(7, zoom));
+  return Math.min(14, Math.max(5, zoom));
 }
 
 function updateAutoFollow(pos, aheadPos) {
