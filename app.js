@@ -362,8 +362,10 @@ async function stopRecording() {
 let playbackMap, ghostLayers, activeLine, playMarker, currentPlayTrip, currentHoliday;
 let photoMarkers = [];
 let photoEntries = [];
-let liveThumbMarker = null;
-let liveThumbPhotoId = null;
+let stayPulseMarker = null;
+let memoryShownIds = new Set();
+let memoryActive = null;
+let memoryTimer = null;
 let uniformModeEnabled = false;
 let followEnabled = false;
 let autoZoomCurrent = null;
@@ -394,10 +396,121 @@ function pointAtSimTime(points, simTime) {
   return { idx: points.length - 1, pos: points[points.length - 1] };
 }
 
-/* ---- adaptive playback pace: slow near photos/turns, fast through stationary or steady stretches ----
- * Local speed describes a whole point-to-point interval, so it's stored as a flat "base" multiplier
- * spanning that interval (a stop is fast-forwarded evenly for its whole duration, however long).
- * Turns and photos are momentary, so they're stored as smooth time-radius "dips" layered on top. */
+/* ---- stay/jump detection + compressed display timeline ----
+ * A merged trip carries the real hours-long gaps between its original legs, and any trip can
+ * contain long stationary stretches (an overnight stop, a parked car). Instead of playing those
+ * in proportion, the display timeline compresses each one to a short fixed span and surfaces it
+ * as an event ("Stayed here · 2 nights" / "Traveling · +6 h") so playback never idles. */
+const STAY_RADIUS_M = 100; // points wandering within this of a running centroid count as one stay
+const STAY_MIN_MS = 10 * 60 * 1000;
+const GAP_MIN_MS = 5 * 60 * 1000; // a single recording gap this long is a stay or an unrecorded jump
+const GAP_STAY_DIST_M = 300;
+const EVENT_SYNTH_MS = 50000; // compressed display span of a stay/jump (~2.5 s at the default 20x)
+
+function detectStays(points) {
+  const n = points.length;
+  const spans = [];
+
+  for (let i = 1; i < n; i++) {
+    if (points[i].ts - points[i - 1].ts >= GAP_MIN_MS) spans.push({ startIdx: i - 1, endIdx: i });
+  }
+
+  let s = 0, latSum = points[0].lat, lngSum = points[0].lng, count = 1;
+  const closeRun = (endIdx) => {
+    if (endIdx > s && points[endIdx].ts - points[s].ts >= STAY_MIN_MS) spans.push({ startIdx: s, endIdx });
+  };
+  for (let i = 1; i < n; i++) {
+    if (haversine({ lat: latSum / count, lng: lngSum / count }, points[i]) <= STAY_RADIUS_M) {
+      latSum += points[i].lat; lngSum += points[i].lng; count++;
+      continue;
+    }
+    closeRun(i - 1);
+    s = i; latSum = points[i].lat; lngSum = points[i].lng; count = 1;
+  }
+  closeRun(n - 1);
+
+  spans.sort((a, b) => a.startIdx - b.startIdx || a.endIdx - b.endIdx);
+  const merged = [];
+  for (const sp of spans) {
+    const last = merged[merged.length - 1];
+    if (last && sp.startIdx <= last.endIdx) last.endIdx = Math.max(last.endIdx, sp.endIdx);
+    else merged.push({ ...sp });
+  }
+  for (const sp of merged) {
+    sp.kind = haversine(points[sp.startIdx], points[sp.endIdx]) >= GAP_STAY_DIST_M ? 'jump' : 'stay';
+  }
+  return merged;
+}
+
+function buildTripTimeline(points) {
+  const spans = detectStays(points);
+  const factor = new Array(points.length).fill(1); // per-interval compression, interval i = (i-1 -> i)
+  for (const sp of spans) {
+    const realSpan = points[sp.endIdx].ts - points[sp.startIdx].ts;
+    const f = realSpan > 0 ? Math.min(realSpan, EVENT_SYNTH_MS) / realSpan : 1;
+    for (let i = sp.startIdx + 1; i <= sp.endIdx; i++) factor[i] = f;
+  }
+  const out = [{ lat: points[0].lat, lng: points[0].lng, speed: points[0].speed, ts: 0, realTs: points[0].ts }];
+  for (let i = 1; i < points.length; i++) {
+    const p = points[i];
+    out.push({ lat: p.lat, lng: p.lng, speed: p.speed, ts: out[i - 1].ts + (p.ts - points[i - 1].ts) * factor[i], realTs: p.ts });
+  }
+  const events = spans.map((sp) => ({
+    kind: sp.kind,
+    synthStart: out[sp.startIdx].ts,
+    synthEnd: out[sp.endIdx].ts,
+    realStart: points[sp.startIdx].ts,
+    realEnd: points[sp.endIdx].ts,
+    realSpanMs: points[sp.endIdx].ts - points[sp.startIdx].ts,
+    lat: points[sp.startIdx].lat,
+    lng: points[sp.startIdx].lng,
+  }));
+  return { points: out, events, maxMs: out[out.length - 1].ts };
+}
+
+function synthTimeForRealTs(points, realTs) {
+  const key = (p) => (p.realTs != null ? p.realTs : p.ts);
+  if (realTs <= key(points[0])) return points[0].ts;
+  const last = points[points.length - 1];
+  if (realTs >= key(last)) return last.ts;
+  for (let i = 0; i < points.length - 1; i++) {
+    const a = points[i], b = points[i + 1];
+    if (key(a) <= realTs && key(b) >= realTs) {
+      const span = key(b) - key(a) || 1;
+      return a.ts + (b.ts - a.ts) * ((realTs - key(a)) / span);
+    }
+  }
+  return last.ts;
+}
+
+function eventAtSimTime(simTime) {
+  const list = currentHoliday ? currentHoliday.events : playState.events;
+  if (!list) return null;
+  return list.find((e) => simTime >= e.synthStart && simTime <= e.synthEnd) || null;
+}
+
+function nightsBetween(a, b) {
+  const d1 = new Date(a); d1.setHours(0, 0, 0, 0);
+  const d2 = new Date(b); d2.setHours(0, 0, 0, 0);
+  return Math.round((d2 - d1) / 86400000);
+}
+function fmtSpanShort(ms) {
+  const h = ms / 3600000;
+  if (h >= 10) return Math.round(h) + ' h';
+  if (h >= 1) return (Math.round(h * 10) / 10) + ' h';
+  return Math.max(1, Math.round(ms / 60000)) + ' min';
+}
+function stayLabel(ev) {
+  if (ev.kind === 'jump') return `Traveling · +${fmtSpanShort(ev.realSpanMs)}`;
+  const nights = nightsBetween(ev.realStart, ev.realEnd);
+  if (nights >= 1 && ev.realSpanMs >= 18 * 3600000) return `Stayed here · ${nights} night${nights === 1 ? '' : 's'}`;
+  return `Stayed here · ${fmtSpanShort(ev.realSpanMs)}`;
+}
+
+/* ---- adaptive playback pace: slow near photos/turns ----
+ * Turns and photos are momentary, so they're stored as smooth time-radius "dips" that ease
+ * playback into and out of the moment. (Stationary stretches used to get a flat fast-forward
+ * multiplier here; the compressed display timeline above made that redundant.) */
 const TURN_RADIUS_MS = 20000;
 const PHOTO_RADIUS_MS = 45000;
 
@@ -415,9 +528,7 @@ function buildPaceProfile(points, photosForTrip, simOffset) {
 
   const intervals = [];
   for (let i = 1; i < n; i++) {
-    let base = 1;
-    if (localSpeed[i] < 0.3) base = 1.8; // stationary/parked — fast-forward through it
-    else if (localSpeed[i] > 4) base = 1.15; // steady, uneventful travel
+    const base = localSpeed[i] > 4 ? 1.15 : 1; // nudge steady, uneventful travel along
     intervals.push({ start: points[i - 1].ts - simOffset, end: points[i].ts - simOffset, base });
   }
 
@@ -516,10 +627,24 @@ function setupPlaybackMap(legsForGhost) {
   playMarker = L.circleMarker([firstPt.lat, firstPt.lng], { radius: 7, color: '#F0EAD8', fillColor: '#E8934A', fillOpacity: 1, weight: 2 }).addTo(playbackMap);
   if (allBounds) playbackMap.fitBounds(allBounds, { padding: [30, 30] });
   photoMarkers = [];
-  liveThumbMarker = null;
-  liveThumbPhotoId = null;
+  stayPulseMarker = null;
   followEnabled = false;
   autoZoomCurrent = null;
+}
+
+function updateStayPulse(ev) {
+  if (!ev) {
+    if (stayPulseMarker) { playbackMap.removeLayer(stayPulseMarker); stayPulseMarker = null; }
+    return;
+  }
+  if (!stayPulseMarker) {
+    stayPulseMarker = L.marker([ev.lat, ev.lng], {
+      icon: L.divIcon({ className: 'stay-pulse', html: '<div class="stay-pulse-ring"></div>', iconSize: [64, 64], iconAnchor: [32, 32] }),
+      interactive: false,
+    }).addTo(playbackMap);
+  } else {
+    stayPulseMarker.setLatLng([ev.lat, ev.lng]);
+  }
 }
 
 /* ---- auto-follow camera: zoom based on how much ground is covered in the next few seconds,
@@ -561,14 +686,17 @@ async function openPlayback(id) {
   document.getElementById('playbackTitle').textContent = currentPlayTrip.name;
   document.getElementById('legBanner').classList.remove('active');
   showView('playback');
-  setupPlaybackMap([{ points: currentPlayTrip.points }]);
+  const timeline = buildTripTimeline(currentPlayTrip.points);
+  setupPlaybackMap([{ points: timeline.points }]);
+  dismissPhotoMemory();
+  memoryShownIds = new Set();
 
   const allPhotos = await dbGetAllStore('photos');
   const tripPhotos = allPhotos.filter((p) => p.tripId === currentPlayTrip.id);
-  const paceProfile = buildPaceProfile(currentPlayTrip.points, tripPhotos, currentPlayTrip.points[0].ts);
+  const paceProfile = buildPaceProfile(timeline.points, tripPhotos, 0);
 
-  const maxMs = currentPlayTrip.points[currentPlayTrip.points.length - 1].ts - currentPlayTrip.points[0].ts;
-  playState = { playing: false, speed: 20, rafId: null, simTime: 0, lastFrameReal: 0, maxMs, renderFn: renderFrame, paceProfile };
+  const maxMs = timeline.maxMs;
+  playState = { playing: false, speed: 20, rafId: null, simTime: 0, lastFrameReal: 0, maxMs, renderFn: renderFrame, paceProfile, displayPoints: timeline.points, events: timeline.events };
   setSpeedButtons(20);
   setUniformMode(uniformModeEnabled);
   document.getElementById('scrubber').max = maxMs;
@@ -579,7 +707,7 @@ async function openPlayback(id) {
 }
 
 function renderFrame(simTime) {
-  const pts = currentPlayTrip.points;
+  const pts = playState.displayPoints;
   const { idx, pos } = pointAtSimTime(pts, simTime);
   const traced = pts.slice(0, idx + 1).map((p) => [p.lat, p.lng]);
   traced.push([pos.lat, pos.lng]);
@@ -591,16 +719,41 @@ function renderFrame(simTime) {
     dist += haversine({ lat: traced[i - 1][0], lng: traced[i - 1][1] }, { lat: traced[i][0], lng: traced[i][1] });
   }
 
+  const ev = eventAtSimTime(simTime);
+  const banner = document.getElementById('legBanner');
+  if (ev) {
+    banner.textContent = stayLabel(ev);
+    banner.classList.add('active');
+  } else {
+    banner.classList.remove('active');
+  }
+  updateStayPulse(ev);
+
   document.getElementById('scrubber').value = simTime;
-  document.getElementById('readoutClock').textContent = fmtClock(pos.ts);
+  document.getElementById('readoutClock').textContent = fmtClock(pos.realTs ?? pos.ts);
   document.getElementById('readoutDist').textContent = fmtDistance(dist);
-  document.getElementById('readoutSpeed').textContent = pos.speed ? (pos.speed * 3.6).toFixed(1) + ' km/h' : '\u2014';
+  document.getElementById('readoutSpeed').textContent = ev ? '\u2014' : fmtSpeed(computeSpeedKmh(pts, pos.realTs ?? pos.ts));
   updatePaceBadge(simTime);
-  updateLivePhotoThumb(pos, simTime);
   if (followEnabled) {
     const aheadPos = pointAtSimTime(pts, Math.min(simTime + FOLLOW_LOOKAHEAD_MS, playState.maxMs)).pos;
     updateAutoFollow(pos, aheadPos);
   }
+}
+
+/* ---- human-readable speed: displacement over a \u00b130 s real-time window, since raw GPS speed
+ * is null on imported/merged points and too jittery for a readout anyway ---- */
+function computeSpeedKmh(points, realTs) {
+  const key = (p) => (p.realTs != null ? p.realTs : p.ts);
+  const t0 = Math.max(key(points[0]), realTs - 30000);
+  const t1 = Math.min(key(points[points.length - 1]), realTs + 30000);
+  if (t1 - t0 < 5000) return null;
+  const a = interpolateByRealTs(points, t0);
+  const b = interpolateByRealTs(points, t1);
+  return (haversine(a, b) / ((t1 - t0) / 1000)) * 3.6;
+}
+function fmtSpeed(kmh) {
+  if (kmh == null) return '\u2014';
+  return (kmh < 10 ? kmh.toFixed(1) : String(Math.round(kmh))) + ' km/h';
 }
 
 /* ---- holiday (multi-trip) playback ---- */
@@ -609,20 +762,19 @@ const GAP_MS = 40000; // synthetic pause between legs, scaled by playback speed 
 function buildHolidayTimeline(tripList) {
   let cursor = 0;
   const legs = [];
+  const events = [];
   tripList.forEach((trip, i) => {
-    const pts = trip.points;
-    const origStart = pts[0].ts;
+    const tl = buildTripTimeline(trip.points); // stays inside a leg compress just like in a single trip
     const synthStart = cursor;
-    const legPoints = pts.map((p) => ({
-      lat: p.lat, lng: p.lng, speed: p.speed,
-      ts: synthStart + (p.ts - origStart),
-      realTs: p.ts,
-    }));
-    const synthEnd = legPoints[legPoints.length - 1].ts;
+    const legPoints = tl.points.map((p) => ({ ...p, ts: synthStart + p.ts }));
+    const synthEnd = synthStart + tl.maxMs;
+    for (const ev of tl.events) {
+      events.push({ ...ev, synthStart: synthStart + ev.synthStart, synthEnd: synthStart + ev.synthEnd });
+    }
     legs.push({ tripId: trip.id, name: trip.name, synthStart, synthEnd, distance: trip.distance || pathDistance(legPoints), realStart: trip.startTime, points: legPoints });
     cursor = synthEnd + (i < tripList.length - 1 ? GAP_MS : 0);
   });
-  return { legs, maxMs: cursor };
+  return { legs, events, maxMs: cursor };
 }
 
 async function openHolidayPlayback(collectionId) {
@@ -640,9 +792,11 @@ async function openHolidayPlayback(collectionId) {
     return;
   }
 
-  const { legs, maxMs } = buildHolidayTimeline(tripList);
-  currentHoliday = { collection, legs };
+  const { legs, events, maxMs } = buildHolidayTimeline(tripList);
+  currentHoliday = { collection, legs, events };
   currentPlayTrip = null;
+  dismissPhotoMemory();
+  memoryShownIds = new Set();
 
   const allPhotos = await dbGetAllStore('photos');
   legs.forEach((leg) => {
@@ -671,6 +825,7 @@ function legAtSimTime(simTime) {
 function renderHolidayFrame(simTime) {
   const banner = document.getElementById('legBanner');
   const leg = legAtSimTime(simTime);
+  const ev = eventAtSimTime(simTime);
   let pos, partialDist = 0;
 
   if (leg) {
@@ -679,7 +834,7 @@ function renderHolidayFrame(simTime) {
     const traced = leg.points.slice(0, local.idx + 1);
     activeLine.setLatLngs(traced.concat([pos]).map((p) => [p.lat, p.lng]));
     partialDist = pathDistance(traced.concat([pos]));
-    banner.textContent = `${leg.name} \u00b7 ${fmtDate(leg.realStart)}`;
+    banner.textContent = ev ? stayLabel(ev) : `${leg.name} \u00b7 ${fmtDate(leg.realStart)}`;
   } else {
     const prevLeg = [...currentHoliday.legs].reverse().find((l) => l.synthEnd <= simTime);
     const nextLeg = currentHoliday.legs.find((l) => l.synthStart > simTime);
@@ -688,6 +843,7 @@ function renderHolidayFrame(simTime) {
     banner.textContent = nextLeg ? `Traveling to ${nextLeg.name}\u2026` : 'Holiday complete';
   }
   banner.classList.add('active');
+  updateStayPulse(ev);
   playMarker.setLatLng([pos.lat, pos.lng]);
 
   let completedDist = 0;
@@ -699,9 +855,8 @@ function renderHolidayFrame(simTime) {
   document.getElementById('scrubber').value = simTime;
   document.getElementById('readoutClock').textContent = fmtClock(pos.realTs ?? pos.ts);
   document.getElementById('readoutDist').textContent = fmtDistance(totalDist);
-  document.getElementById('readoutSpeed').textContent = pos.speed ? (pos.speed * 3.6).toFixed(1) + ' km/h' : '\u2014';
+  document.getElementById('readoutSpeed').textContent = ev || !leg ? '\u2014' : fmtSpeed(computeSpeedKmh(leg.points, pos.realTs ?? pos.ts));
   updatePaceBadge(simTime);
-  updateLivePhotoThumb(pos, simTime);
   if (followEnabled) {
     let aheadPos = pos;
     if (leg) aheadPos = pointAtSimTime(leg.points, Math.min(simTime + FOLLOW_LOOKAHEAD_MS, leg.synthEnd) - leg.synthStart).pos;
@@ -711,12 +866,21 @@ function renderHolidayFrame(simTime) {
 
 /* ---- shared playback controls ---- */
 function playbackTick(nowReal) {
-  if (!playState.playing) return;
+  if (!playState.playing || playState.holding) return;
   const dtReal = nowReal - playState.lastFrameReal;
   playState.lastFrameReal = nowReal;
   const pace = currentPaceMultiplier(playState.simTime);
   const base = currentBaseSpeed(playState.simTime);
-  playState.simTime += dtReal * base * pace;
+  const nextSim = playState.simTime + dtReal * base * pace;
+  const photoHit = nextUnshownPhotoBetween(playState.simTime, nextSim);
+  if (photoHit) {
+    // land exactly on the photo's moment and hold there while the memory card shows
+    playState.simTime = Math.min(photoHit.synth, playState.maxMs);
+    playState.renderFn(playState.simTime);
+    showPhotoMemory(photoHit);
+    return;
+  }
+  playState.simTime = nextSim;
   if (playState.simTime >= playState.maxMs) {
     playState.simTime = playState.maxMs;
     playState.renderFn(playState.simTime);
@@ -727,6 +891,7 @@ function playbackTick(nowReal) {
   playState.rafId = requestAnimationFrame(playbackTick);
 }
 function startPlayback() {
+  if (playState.holding) dismissPhotoMemory();
   playState.playing = true;
   followEnabled = true;
   document.getElementById('playToggle').textContent = '\u23F8';
@@ -770,10 +935,9 @@ function photoSimTime(photo) {
   if (currentHoliday) {
     const leg = currentHoliday.legs.find((l) => l.tripId === photo.tripId);
     if (!leg) return null;
-    const origStart = leg.points[0].realTs;
-    return leg.synthStart + (photo.ts - origStart);
+    return synthTimeForRealTs(leg.points, photo.ts); // leg points carry compressed synthetic ts
   }
-  if (currentPlayTrip) return photo.ts - currentPlayTrip.points[0].ts;
+  if (currentPlayTrip) return synthTimeForRealTs(playState.displayPoints, photo.ts);
   return null;
 }
 
@@ -785,7 +949,7 @@ async function loadPhotoPins(tripIds, preloaded) {
   const mine = all.filter((p) => tripIds.includes(p.tripId));
   for (const photo of mine) {
     const url = URL.createObjectURL(photo.blob);
-    photoEntries.push({ photo, url });
+    photoEntries.push({ photo, url, synth: photoSimTime(photo) });
     const icon = L.divIcon({
       className: 'photo-pin',
       html: `<div class="photo-pin-thumb" style="background-image:url('${url}')"></div>`,
@@ -796,7 +960,9 @@ async function loadPhotoPins(tripIds, preloaded) {
       const simTime = photoSimTime(photo);
       if (simTime != null) {
         pausePlayback();
+        dismissPhotoMemory();
         playState.simTime = Math.max(0, Math.min(simTime, playState.maxMs));
+        rearmMemoriesAfter(playState.simTime);
         playState.renderFn(playState.simTime);
       }
       openPhotoLightbox(photo, url);
@@ -805,44 +971,63 @@ async function loadPhotoPins(tripIds, preloaded) {
   }
 }
 
-/* ---- live photo callout: surfaces the nearest photo right alongside the moving marker ---- */
-function nearestPhotoEntryAt(simTime) {
-  let best = null, bestDist = Infinity;
+/* ---- photo memory card: when playback reaches a photo's moment, glide to a stop and show it
+ * big with its date/time, Google Photos memory style, then resume automatically ---- */
+const MEMORY_HOLD_MS = 2600;
+
+function nextUnshownPhotoBetween(fromSim, toSim) {
+  let best = null;
   for (const entry of photoEntries) {
-    const st = photoSimTime(entry.photo);
-    if (st == null) continue;
-    const dist = Math.abs(st - simTime);
-    if (dist < bestDist) { bestDist = dist; best = entry; }
+    if (entry.synth == null || memoryShownIds.has(entry.photo.id)) continue;
+    if (entry.synth > fromSim && entry.synth <= toSim && (!best || entry.synth < best.synth)) best = entry;
   }
-  return best && bestDist <= PHOTO_RADIUS_MS ? best : null;
+  return best;
 }
 
-function updateLivePhotoThumb(pos, simTime) {
-  const nearest = nearestPhotoEntryAt(simTime);
-  if (!nearest) {
-    if (liveThumbMarker) { playbackMap.removeLayer(liveThumbMarker); liveThumbMarker = null; liveThumbPhotoId = null; }
-    return;
+function tripStartRealTs() {
+  if (currentHoliday) return currentHoliday.legs[0].points[0].realTs;
+  if (currentPlayTrip && playState.displayPoints) return playState.displayPoints[0].realTs;
+  return null;
+}
+
+function photoCaption(photo) {
+  const datePart = new Date(photo.ts).toLocaleDateString(undefined, { weekday: 'short', day: 'numeric', month: 'short' });
+  let caption = `${datePart} · ${fmtClock(photo.ts)}`;
+  const start = tripStartRealTs();
+  if (start != null) {
+    const day = nightsBetween(start, photo.ts) + 1;
+    if (day > 1) caption += ` · Day ${day}`;
   }
-  if (!liveThumbMarker) {
-    const icon = L.divIcon({
-      className: 'live-photo-thumb',
-      html: `<div class="live-photo-thumb-inner" style="background-image:url('${nearest.url}')"></div>`,
-      iconSize: [46, 46],
-      iconAnchor: [23, 66],
-    });
-    liveThumbMarker = L.marker([pos.lat, pos.lng], { icon, interactive: false }).addTo(playbackMap);
-    liveThumbPhotoId = nearest.photo.id;
-    return;
-  }
-  liveThumbMarker.setLatLng([pos.lat, pos.lng]);
-  if (liveThumbPhotoId !== nearest.photo.id) {
-    liveThumbMarker.setIcon(L.divIcon({
-      className: 'live-photo-thumb',
-      html: `<div class="live-photo-thumb-inner" style="background-image:url('${nearest.url}')"></div>`,
-      iconSize: [46, 46],
-      iconAnchor: [23, 66],
-    }));
-    liveThumbPhotoId = nearest.photo.id;
+  return caption;
+}
+
+function showPhotoMemory(entry) {
+  memoryActive = entry;
+  memoryShownIds.add(entry.photo.id);
+  document.getElementById('photoMemoryImg').src = entry.url;
+  document.getElementById('photoMemoryCaption').textContent = photoCaption(entry.photo);
+  document.getElementById('photoMemory').classList.add('active');
+  playState.holding = true;
+  memoryTimer = setTimeout(() => {
+    dismissPhotoMemory();
+    if (playState.playing) {
+      playState.lastFrameReal = performance.now();
+      playState.rafId = requestAnimationFrame(playbackTick);
+    }
+  }, MEMORY_HOLD_MS);
+}
+
+function dismissPhotoMemory() {
+  if (memoryTimer) { clearTimeout(memoryTimer); memoryTimer = null; }
+  memoryActive = null;
+  playState.holding = false;
+  document.getElementById('photoMemory').classList.remove('active');
+}
+
+/* photos ahead of this point may fire again — used after seeking backwards */
+function rearmMemoriesAfter(simTime) {
+  for (const entry of photoEntries) {
+    if (entry.synth != null && entry.synth > simTime) memoryShownIds.delete(entry.photo.id);
   }
 }
 
@@ -853,8 +1038,8 @@ function currentPlaybackPosition() {
     const { pos } = pointAtSimTime(leg.points, clamped - leg.synthStart);
     return { lat: pos.lat, lng: pos.lng, ts: pos.realTs ?? leg.realStart, tripId: leg.tripId };
   }
-  const { pos } = pointAtSimTime(currentPlayTrip.points, playState.simTime);
-  return { lat: pos.lat, lng: pos.lng, ts: pos.ts, tripId: currentPlayTrip.id };
+  const { pos } = pointAtSimTime(playState.displayPoints, playState.simTime);
+  return { lat: pos.lat, lng: pos.lng, ts: pos.realTs ?? pos.ts, tripId: currentPlayTrip.id };
 }
 
 /* ---- EXIF: place a photo by its own GPS/timestamp instead of the scrubber position ---- */
@@ -981,6 +1166,22 @@ async function resolvePhotoAnchor(file) {
   let tripId = fallback.tripId;
   let points = currentHoliday ? null : currentPlayTrip.points;
 
+  if (exif.ts == null && exif.lat != null) {
+    // no timestamp — snap to the nearest track point by location and take its time
+    const candidates = currentHoliday
+      ? currentHoliday.legs.map((l) => ({ id: l.tripId, pts: l.points }))
+      : [{ id: tripId, pts: points }];
+    let bestTrip = tripId, bestDist = Infinity, bestPoint = null;
+    for (const c of candidates) {
+      const { point, dist } = nearestTrackPoint(c.pts, exif);
+      if (dist < bestDist) { bestDist = dist; bestPoint = point; bestTrip = c.id; }
+    }
+    if (bestPoint && bestDist <= PHOTO_GPS_ONLY_MAX_M) {
+      return { tripId: bestTrip, lat: exif.lat, lng: exif.lng, ts: bestPoint.realTs != null ? bestPoint.realTs : bestPoint.ts };
+    }
+    return { tripId, lat: exif.lat, lng: exif.lng, ts: fallback.ts };
+  }
+
   if (currentHoliday && exif.ts != null) {
     const BUFFER_MS = 10 * 60 * 1000;
     const match = currentHoliday.legs.find((l) => {
@@ -1002,20 +1203,63 @@ async function resolvePhotoAnchor(file) {
   return { tripId, lat, lng, ts };
 }
 
-/* ---- home-screen bulk photo add: auto-match a whole batch to the right trip by EXIF time ---- */
-function findMatchingTrip(trips, ts) {
-  const BUFFER_MS = 10 * 60 * 1000;
-  let best = null, bestDist = Infinity;
-  for (const t of trips) {
-    if (!t.points || t.points.length === 0) continue;
-    const start = t.points[0].ts - BUFFER_MS;
-    const end = (t.endTime || t.points[t.points.length - 1].ts) + BUFFER_MS;
-    if (ts < start || ts > end) continue;
-    const center = (t.points[0].ts + (t.endTime || t.points[t.points.length - 1].ts)) / 2;
-    const dist = Math.abs(ts - center);
-    if (dist < bestDist) { bestDist = dist; best = t; }
+/* ---- home-screen bulk photo add: auto-match a whole batch to the right trip by EXIF time + GPS ---- */
+const PHOTO_TRACK_MAX_M = 2000; // a photo whose GPS is further than this from the track at its time isn't from that trip
+const PHOTO_GPS_ONLY_MAX_M = 250; // matching by location alone needs to be much tighter
+
+function nearestTrackPoint(points, loc) {
+  let best = null, bestD = Infinity;
+  for (const p of points) {
+    const d = haversine(p, loc);
+    if (d < bestD) { bestD = d; best = p; }
   }
-  return best;
+  return { point: best, dist: bestD };
+}
+
+/* Returns { trip, lat, lng, ts } or null. Time is the primary key, validated/refined by GPS when
+ * present; photos with GPS but no timestamp match by location and take their time from the track. */
+function matchPhotoToTrip(trips, exif) {
+  const BUFFER_MS = 10 * 60 * 1000;
+  const usable = trips.filter((t) => t.points && t.points.length >= 2);
+
+  if (exif.ts != null) {
+    let best = null, bestScore = Infinity;
+    for (const t of usable) {
+      const start = t.points[0].ts - BUFFER_MS;
+      const end = (t.endTime || t.points[t.points.length - 1].ts) + BUFFER_MS;
+      if (exif.ts < start || exif.ts > end) continue;
+      let score;
+      if (exif.lat != null) {
+        const d = haversine(interpolateByRealTs(t.points, exif.ts), exif);
+        if (d > PHOTO_TRACK_MAX_M) continue;
+        score = d;
+      } else {
+        const center = (t.points[0].ts + (t.endTime || t.points[t.points.length - 1].ts)) / 2;
+        score = Math.abs(exif.ts - center);
+      }
+      if (score < bestScore) { bestScore = score; best = t; }
+    }
+    if (!best) return null;
+    let lat = exif.lat, lng = exif.lng;
+    if (lat == null) {
+      const pos = interpolateByRealTs(best.points, exif.ts);
+      lat = pos.lat;
+      lng = pos.lng;
+    }
+    return { trip: best, lat, lng, ts: exif.ts };
+  }
+
+  if (exif.lat != null) {
+    let best = null, bestDist = Infinity, bestPoint = null;
+    for (const t of usable) {
+      const { point, dist } = nearestTrackPoint(t.points, exif);
+      if (dist < bestDist) { bestDist = dist; best = t; bestPoint = point; }
+    }
+    if (!best || bestDist > PHOTO_GPS_ONLY_MAX_M) return null;
+    return { trip: best, lat: exif.lat, lng: exif.lng, ts: bestPoint.ts };
+  }
+
+  return null;
 }
 
 async function bulkAddPhotos(files) {
@@ -1023,24 +1267,17 @@ async function bulkAddPhotos(files) {
   let matched = 0, skipped = 0;
   for (const file of files) {
     const exif = await readExifGps(file);
-    if (!exif || exif.ts == null) { skipped++; continue; }
-    const trip = findMatchingTrip(trips, exif.ts);
-    if (!trip) { skipped++; continue; }
-    let lat = exif.lat, lng = exif.lng;
-    if (lat == null) {
-      const pos = interpolateByRealTs(trip.points, exif.ts);
-      lat = pos.lat;
-      lng = pos.lng;
-    }
+    const match = exif ? matchPhotoToTrip(trips, exif) : null;
+    if (!match) { skipped++; continue; }
     await dbPutStore('photos', {
       id: 'photo-' + Date.now() + '-' + Math.random().toString(36).slice(2),
-      tripId: trip.id, lat, lng, ts: exif.ts, blob: file,
+      tripId: match.trip.id, lat: match.lat, lng: match.lng, ts: match.ts, blob: file,
     });
     matched++;
   }
   await renderHome();
   const skippedMsg = skipped
-    ? ` ${skipped} couldn’t be matched (no GPS/time metadata, or no saved trip covers that time) and ${skipped === 1 ? 'was' : 'were'} skipped.`
+    ? ` ${skipped} couldn’t be matched (no GPS/time metadata, or no saved trip covers that time and place) and ${skipped === 1 ? 'was' : 'were'} skipped.`
     : '';
   alert(`${matched} photo${matched === 1 ? '' : 's'} added to your trips.${skippedMsg}`);
 }
@@ -1333,9 +1570,18 @@ window.addEventListener('DOMContentLoaded', () => {
 
   document.getElementById('scrubber').addEventListener('input', (e) => {
     pausePlayback();
+    dismissPhotoMemory();
     followEnabled = true;
     playState.simTime = Number(e.target.value);
+    rearmMemoriesAfter(playState.simTime);
     playState.renderFn(playState.simTime);
+  });
+
+  document.getElementById('photoMemory').addEventListener('click', () => {
+    const entry = memoryActive;
+    dismissPhotoMemory();
+    pausePlayback();
+    if (entry) openPhotoLightbox(entry.photo, entry.url);
   });
 
   document.querySelectorAll('.speed-btn[data-speed]').forEach((b) => {
