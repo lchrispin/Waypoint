@@ -96,10 +96,13 @@ function showView(name) {
 /* ================= HOME ================= */
 let selectMode = false;
 let selectedTripIds = new Set();
+let renameTarget = null;
 
 async function renderHome() {
-  const [trips, collections] = await Promise.all([dbGetAll(), dbGetAllStore('collections')]);
+  const [trips, collections, photos] = await Promise.all([dbGetAll(), dbGetAllStore('collections'), dbGetAllStore('photos')]);
   const tripsById = Object.fromEntries(trips.map((t) => [t.id, t]));
+  const photoCountByTrip = {};
+  for (const p of photos) photoCountByTrip[p.tripId] = (photoCountByTrip[p.tripId] || 0) + 1;
 
   const holidayList = document.getElementById('holidayList');
   holidayList.innerHTML = '';
@@ -115,6 +118,7 @@ async function renderHome() {
         const members = c.tripIds.map((id) => tripsById[id]).filter(Boolean);
         const starts = members.map((t) => t.startTime);
         const totalDist = members.reduce((s, t) => s + (t.distance || 0), 0);
+        const photoCount = members.reduce((s, t) => s + (photoCountByTrip[t.id] || 0), 0);
         const card = document.createElement('div');
         card.className = 'trip-card';
         card.innerHTML = `
@@ -123,6 +127,7 @@ async function renderHome() {
             <span>${starts.length ? fmtDate(Math.min(...starts)) : '\u2014'}</span>
             <span>${fmtDistance(totalDist)}</span>
             <span>${members.length} leg${members.length === 1 ? '' : 's'}</span>
+            ${photoCount ? `<span>${photoCount} photo${photoCount === 1 ? '' : 's'}</span>` : ''}
           </div>`;
         card.addEventListener('click', () => openHolidayPlayback(c.id));
         holidayList.appendChild(card);
@@ -146,6 +151,7 @@ async function renderHome() {
     const card = document.createElement('div');
     card.className = 'trip-card' + (selectMode ? ' selectable' : '');
     const dur = t.endTime ? fmtDuration((t.endTime - t.startTime) / 1000) : '\u2014';
+    const photoCount = photoCountByTrip[t.id] || 0;
     card.innerHTML = `
       ${selectMode ? `<input type="checkbox" class="tripSelectCheck" data-id="${t.id}" ${selectedTripIds.has(t.id) ? 'checked' : ''} />` : ''}
       <div>
@@ -155,6 +161,7 @@ async function renderHome() {
           <span>${fmtDistance(t.distance || 0)}</span>
           <span>${dur}</span>
           <span>${(t.points || []).length} pts</span>
+          ${photoCount ? `<span>${photoCount} photo${photoCount === 1 ? '' : 's'}</span>` : ''}
         </div>
       </div>`;
     if (selectMode) {
@@ -173,9 +180,16 @@ async function renderHome() {
 function toggleTripSelect(id, checked) {
   if (checked) selectedTripIds.add(id);
   else selectedTripIds.delete(id);
-  const btn = document.getElementById('fabCombine');
-  btn.textContent = `Combine (${selectedTripIds.size})`;
-  btn.disabled = selectedTripIds.size < 2;
+  const n = selectedTripIds.size;
+  const combineBtn = document.getElementById('fabCombine');
+  combineBtn.textContent = `Combine (${n})`;
+  combineBtn.disabled = n < 2;
+  const mergeBtn = document.getElementById('mergeBtn');
+  mergeBtn.textContent = `Merge (${n})`;
+  mergeBtn.disabled = n < 2;
+  const deleteBtn = document.getElementById('bulkDeleteBtn');
+  deleteBtn.textContent = n > 0 ? `Delete (${n})` : 'Delete';
+  deleteBtn.disabled = n === 0;
 }
 
 function setSelectMode(on) {
@@ -183,10 +197,62 @@ function setSelectMode(on) {
   selectedTripIds.clear();
   document.getElementById('selectModeBtn').textContent = selectMode ? 'Cancel' : 'Select';
   document.getElementById('fabRecord').style.display = selectMode ? 'none' : '';
-  document.getElementById('fabCombine').style.display = selectMode ? '' : 'none';
+  document.getElementById('selectActionsBar').style.display = selectMode ? 'flex' : 'none';
   document.getElementById('fabCombine').textContent = 'Combine (0)';
   document.getElementById('fabCombine').disabled = true;
+  document.getElementById('mergeBtn').textContent = 'Merge (0)';
+  document.getElementById('mergeBtn').disabled = true;
+  document.getElementById('bulkDeleteBtn').textContent = 'Delete';
+  document.getElementById('bulkDeleteBtn').disabled = true;
   renderHome();
+}
+
+async function mergeSelectedTrips(name) {
+  const ids = [...selectedTripIds];
+  if (ids.length < 2) return;
+  const trips = await dbGetAll();
+  const members = trips.filter((t) => ids.includes(t.id)).sort((a, b) => a.startTime - b.startTime);
+  if (members.length < 2) return;
+
+  const points = members.flatMap((t) => t.points || []).sort((a, b) => a.ts - b.ts);
+  const newId = 'merge-' + Date.now();
+  const lastMember = members[members.length - 1];
+  const merged = {
+    id: newId,
+    name,
+    startTime: members[0].startTime,
+    endTime: lastMember.endTime || points[points.length - 1].ts,
+    points,
+    distance: pathDistance(points),
+  };
+  await dbPut(merged);
+
+  const photos = await dbGetAllStore('photos');
+  for (const p of photos) {
+    if (ids.includes(p.tripId)) {
+      p.tripId = newId;
+      await dbPutStore('photos', p);
+    }
+  }
+
+  const collections = await dbGetAllStore('collections');
+  for (const c of collections) {
+    if (!c.tripIds.some((id) => ids.includes(id))) continue;
+    const newTripIds = [];
+    let inserted = false;
+    for (const tid of c.tripIds) {
+      if (ids.includes(tid)) {
+        if (!inserted) { newTripIds.push(newId); inserted = true; }
+      } else {
+        newTripIds.push(tid);
+      }
+    }
+    c.tripIds = newTripIds;
+    await dbPutStore('collections', c);
+  }
+
+  for (const id of ids) await dbDelete(id);
+  setSelectMode(false);
 }
 
 /* ================= RECORDING ================= */
@@ -507,6 +573,17 @@ function setSpeedButtons(speed) {
 }
 
 /* ---- photos ---- */
+function photoSimTime(photo) {
+  if (currentHoliday) {
+    const leg = currentHoliday.legs.find((l) => l.tripId === photo.tripId);
+    if (!leg) return null;
+    const origStart = leg.points[0].realTs;
+    return leg.synthStart + (photo.ts - origStart);
+  }
+  if (currentPlayTrip) return photo.ts - currentPlayTrip.points[0].ts;
+  return null;
+}
+
 async function loadPhotoPins(tripIds) {
   photoMarkers.forEach((m) => playbackMap.removeLayer(m));
   photoMarkers = [];
@@ -520,7 +597,15 @@ async function loadPhotoPins(tripIds) {
       iconSize: [34, 34],
     });
     const marker = L.marker([photo.lat, photo.lng], { icon }).addTo(playbackMap);
-    marker.on('click', () => openPhotoLightbox(photo, url));
+    marker.on('click', () => {
+      const simTime = photoSimTime(photo);
+      if (simTime != null) {
+        pausePlayback();
+        playState.simTime = Math.max(0, Math.min(simTime, playState.maxMs));
+        playState.renderFn(playState.simTime);
+      }
+      openPhotoLightbox(photo, url);
+    });
     photoMarkers.push(marker);
   }
 }
@@ -851,6 +936,31 @@ window.addEventListener('DOMContentLoaded', () => {
     }
   });
 
+  document.getElementById('renameTripBtn').addEventListener('click', () => {
+    const isHoliday = !!currentHoliday;
+    renameTarget = isHoliday ? { type: 'holiday', id: currentHoliday.collection.id } : { type: 'trip', id: currentPlayTrip.id };
+    document.getElementById('renameModalTitle').textContent = isHoliday ? 'Rename holiday' : 'Rename trip';
+    document.getElementById('renameInput').value = isHoliday ? currentHoliday.collection.name : currentPlayTrip.name;
+    document.getElementById('renameModal').classList.add('active');
+  });
+  document.getElementById('cancelRename').addEventListener('click', () => {
+    document.getElementById('renameModal').classList.remove('active');
+  });
+  document.getElementById('confirmRename').addEventListener('click', async () => {
+    const val = document.getElementById('renameInput').value.trim();
+    if (!val || !renameTarget) { document.getElementById('renameModal').classList.remove('active'); return; }
+    document.getElementById('renameModal').classList.remove('active');
+    if (renameTarget.type === 'holiday') {
+      currentHoliday.collection.name = val;
+      await dbPutStore('collections', currentHoliday.collection);
+    } else {
+      currentPlayTrip.name = val;
+      await dbPut(currentPlayTrip);
+    }
+    document.getElementById('playbackTitle').textContent = val;
+    renameTarget = null;
+  });
+
   document.getElementById('selectModeBtn').addEventListener('click', () => setSelectMode(!selectMode));
   document.getElementById('fabCombine').addEventListener('click', () => {
     if (selectedTripIds.size < 2) return;
@@ -865,6 +975,27 @@ window.addEventListener('DOMContentLoaded', () => {
     document.getElementById('holidayNameModal').classList.remove('active');
     await dbPutStore('collections', { id: 'col-' + Date.now(), name, tripIds: [...selectedTripIds], createdAt: Date.now() });
     setSelectMode(false);
+  });
+
+  document.getElementById('bulkDeleteBtn').addEventListener('click', async () => {
+    const n = selectedTripIds.size;
+    if (n === 0) return;
+    if (!confirm(`Delete ${n} trip${n === 1 ? '' : 's'} permanently? This can't be undone.`)) return;
+    for (const id of selectedTripIds) await dbDelete(id);
+    setSelectMode(false);
+  });
+  document.getElementById('mergeBtn').addEventListener('click', () => {
+    if (selectedTripIds.size < 2) return;
+    document.getElementById('mergeNameInput').value = `Trip \u00b7 ${new Date().toLocaleDateString(undefined, { month: 'short', day: 'numeric' })}`;
+    document.getElementById('mergeNameModal').classList.add('active');
+  });
+  document.getElementById('cancelMergeName').addEventListener('click', () => {
+    document.getElementById('mergeNameModal').classList.remove('active');
+  });
+  document.getElementById('confirmMergeName').addEventListener('click', async () => {
+    const name = document.getElementById('mergeNameInput').value.trim() || 'Merged trip';
+    document.getElementById('mergeNameModal').classList.remove('active');
+    await mergeSelectedTrips(name);
   });
 
   document.getElementById('addPhotoBtn').addEventListener('click', () => document.getElementById('photoFileInput').click());
