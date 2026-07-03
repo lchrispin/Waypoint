@@ -24,6 +24,7 @@
       <div class="wordmark">Waypoint<span class="dot"> · trips</span></div>
       <div style="display:flex; gap:8px;">
         <button id="selectModeBtn" class="icon-btn">Select</button>
+        <button id="addPhotosHomeBtn" class="icon-btn">Add photos</button>
         <button id="importBtn" class="icon-btn">Import</button>
       </div>
     </div>
@@ -32,6 +33,7 @@
       <div id="tripList"></div>
     </div>
     <button id="fabRecord" class="fab">+ Record trip</button>
+    <input type="file" id="homePhotoFileInput" accept="image/*" multiple style="display:none" />
     <div id="selectActionsBar" class="select-actions" style="display:none;">
       <button id="bulkDeleteBtn" class="btn-ghost btn-danger-ghost" disabled>Delete</button>
       <button id="mergeBtn" class="btn-primary btn-teal" disabled>Merge (0)</button>

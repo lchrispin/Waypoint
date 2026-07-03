@@ -365,6 +365,8 @@ let photoEntries = [];
 let liveThumbMarker = null;
 let liveThumbPhotoId = null;
 let uniformModeEnabled = false;
+let followEnabled = false;
+let autoZoomCurrent = null;
 let playState = { playing: false, speed: 20, rafId: null, simTime: 0, lastFrameReal: 0, maxMs: 0, renderFn: null };
 
 function pointAtSimTime(points, simTime) {
@@ -512,6 +514,29 @@ function setupPlaybackMap(legsForGhost) {
   photoMarkers = [];
   liveThumbMarker = null;
   liveThumbPhotoId = null;
+  followEnabled = false;
+  autoZoomCurrent = null;
+}
+
+/* ---- auto-follow camera: zoom based on how much ground is covered in the next few seconds,
+ * so a fast leg (flight/highway) doesn't fly off-screen and a slow one isn't zoomed out to nothing ---- */
+const FOLLOW_LOOKAHEAD_MS = 15000;
+const FOLLOW_ZOOM_SMOOTHING = 0.08;
+
+function computeTargetZoom(pos, aheadPos) {
+  const spanMeters = Math.max(30, haversine(pos, aheadPos));
+  const size = playbackMap.getSize ? playbackMap.getSize() : { x: 360, y: 640 };
+  const minDim = Math.max(100, Math.min(size.x, size.y));
+  const metersPerPixel = spanMeters / (minDim * 0.45);
+  const latRad = (pos.lat * Math.PI) / 180;
+  const zoom = Math.log2((156543.03392 * Math.cos(latRad)) / metersPerPixel);
+  return Math.min(18, Math.max(3, zoom));
+}
+
+function updateAutoFollow(pos, aheadPos) {
+  const target = computeTargetZoom(pos, aheadPos);
+  autoZoomCurrent = autoZoomCurrent == null ? target : autoZoomCurrent + (target - autoZoomCurrent) * FOLLOW_ZOOM_SMOOTHING;
+  playbackMap.setView([pos.lat, pos.lng], autoZoomCurrent);
 }
 
 /* ---- single trip playback ---- */
@@ -562,6 +587,10 @@ function renderFrame(simTime) {
   document.getElementById('readoutSpeed').textContent = pos.speed ? (pos.speed * 3.6).toFixed(1) + ' km/h' : '\u2014';
   updatePaceBadge(simTime);
   updateLivePhotoThumb(pos, simTime);
+  if (followEnabled) {
+    const aheadPos = pointAtSimTime(pts, Math.min(simTime + FOLLOW_LOOKAHEAD_MS, playState.maxMs)).pos;
+    updateAutoFollow(pos, aheadPos);
+  }
 }
 
 /* ---- holiday (multi-trip) playback ---- */
@@ -663,6 +692,11 @@ function renderHolidayFrame(simTime) {
   document.getElementById('readoutSpeed').textContent = pos.speed ? (pos.speed * 3.6).toFixed(1) + ' km/h' : '\u2014';
   updatePaceBadge(simTime);
   updateLivePhotoThumb(pos, simTime);
+  if (followEnabled) {
+    let aheadPos = pos;
+    if (leg) aheadPos = pointAtSimTime(leg.points, Math.min(simTime + FOLLOW_LOOKAHEAD_MS, leg.synthEnd) - leg.synthStart).pos;
+    updateAutoFollow(pos, aheadPos);
+  }
 }
 
 /* ---- shared playback controls ---- */
@@ -684,6 +718,7 @@ function playbackTick(nowReal) {
 }
 function startPlayback() {
   playState.playing = true;
+  followEnabled = true;
   document.getElementById('playToggle').textContent = '\u23F8';
   playState.lastFrameReal = performance.now();
   playState.rafId = requestAnimationFrame(playbackTick);
@@ -955,6 +990,49 @@ async function resolvePhotoAnchor(file) {
 
   const ts = exif.ts != null ? exif.ts : fallback.ts;
   return { tripId, lat, lng, ts };
+}
+
+/* ---- home-screen bulk photo add: auto-match a whole batch to the right trip by EXIF time ---- */
+function findMatchingTrip(trips, ts) {
+  const BUFFER_MS = 10 * 60 * 1000;
+  let best = null, bestDist = Infinity;
+  for (const t of trips) {
+    if (!t.points || t.points.length === 0) continue;
+    const start = t.points[0].ts - BUFFER_MS;
+    const end = (t.endTime || t.points[t.points.length - 1].ts) + BUFFER_MS;
+    if (ts < start || ts > end) continue;
+    const center = (t.points[0].ts + (t.endTime || t.points[t.points.length - 1].ts)) / 2;
+    const dist = Math.abs(ts - center);
+    if (dist < bestDist) { bestDist = dist; best = t; }
+  }
+  return best;
+}
+
+async function bulkAddPhotos(files) {
+  const trips = await dbGetAll();
+  let matched = 0, skipped = 0;
+  for (const file of files) {
+    const exif = await readExifGps(file);
+    if (!exif || exif.ts == null) { skipped++; continue; }
+    const trip = findMatchingTrip(trips, exif.ts);
+    if (!trip) { skipped++; continue; }
+    let lat = exif.lat, lng = exif.lng;
+    if (lat == null) {
+      const pos = interpolateByRealTs(trip.points, exif.ts);
+      lat = pos.lat;
+      lng = pos.lng;
+    }
+    await dbPutStore('photos', {
+      id: 'photo-' + Date.now() + '-' + Math.random().toString(36).slice(2),
+      tripId: trip.id, lat, lng, ts: exif.ts, blob: file,
+    });
+    matched++;
+  }
+  await renderHome();
+  const skippedMsg = skipped
+    ? ` ${skipped} couldn’t be matched (no GPS/time metadata, or no saved trip covers that time) and ${skipped === 1 ? 'was' : 'were'} skipped.`
+    : '';
+  alert(`${matched} photo${matched === 1 ? '' : 's'} added to your trips.${skippedMsg}`);
 }
 
 let lightboxPhoto = null;
@@ -1245,6 +1323,7 @@ window.addEventListener('DOMContentLoaded', () => {
 
   document.getElementById('scrubber').addEventListener('input', (e) => {
     pausePlayback();
+    followEnabled = true;
     playState.simTime = Number(e.target.value);
     playState.renderFn(playState.simTime);
   });
@@ -1299,6 +1378,13 @@ window.addEventListener('DOMContentLoaded', () => {
   });
 
   document.getElementById('selectModeBtn').addEventListener('click', () => setSelectMode(!selectMode));
+  document.getElementById('addPhotosHomeBtn').addEventListener('click', () => document.getElementById('homePhotoFileInput').click());
+  document.getElementById('homePhotoFileInput').addEventListener('change', async (e) => {
+    const files = [...e.target.files];
+    e.target.value = '';
+    if (files.length === 0) return;
+    await bulkAddPhotos(files);
+  });
   document.getElementById('fabCombine').addEventListener('click', () => {
     if (selectedTripIds.size < 2) return;
     document.getElementById('holidayNameInput').value = `Holiday \u00b7 ${new Date().toLocaleDateString(undefined, { month: 'short', year: 'numeric' })}`;
