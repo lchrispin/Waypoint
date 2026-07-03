@@ -361,6 +361,10 @@ async function stopRecording() {
 /* ================= PLAYBACK (shared: single trip + holiday) ================= */
 let playbackMap, ghostLayers, activeLine, playMarker, currentPlayTrip, currentHoliday;
 let photoMarkers = [];
+let photoEntries = [];
+let liveThumbMarker = null;
+let liveThumbPhotoId = null;
+let uniformModeEnabled = false;
 let playState = { playing: false, speed: 20, rafId: null, simTime: 0, lastFrameReal: 0, maxMs: 0, renderFn: null };
 
 function pointAtSimTime(points, simTime) {
@@ -469,6 +473,21 @@ function currentPaceMultiplier(simTime) {
   return paceMultiplierAt(playState.paceProfile, simTime);
 }
 
+/* ---- uniform stage duration: normalize a leg's (or a whole single trip's) real length to one target wall-clock duration ---- */
+const UNIFORM_TARGET_MS = 20000;
+function clampSpeed(v) {
+  return Math.min(5000, Math.max(1, v));
+}
+function currentBaseSpeed(simTime) {
+  if (!uniformModeEnabled) return playState.speed;
+  if (currentHoliday) {
+    const leg = legAtSimTime(simTime);
+    if (leg) return clampSpeed((leg.synthEnd - leg.synthStart) / UNIFORM_TARGET_MS);
+    return playState.speed; // in the gap between legs — no single stage to normalize to
+  }
+  return clampSpeed(playState.maxMs / UNIFORM_TARGET_MS);
+}
+
 function setupPlaybackMap(legsForGhost) {
   if (playbackMap) { playbackMap.remove(); playbackMap = null; }
   playbackMap = L.map('playbackMap', { zoomControl: false }).setView([20, 0], 3);
@@ -491,6 +510,8 @@ function setupPlaybackMap(legsForGhost) {
   playMarker = L.circleMarker([firstPt.lat, firstPt.lng], { radius: 7, color: '#F0EAD8', fillColor: '#E8934A', fillOpacity: 1, weight: 2 }).addTo(playbackMap);
   if (allBounds) playbackMap.fitBounds(allBounds, { padding: [30, 30] });
   photoMarkers = [];
+  liveThumbMarker = null;
+  liveThumbPhotoId = null;
 }
 
 /* ---- single trip playback ---- */
@@ -514,6 +535,7 @@ async function openPlayback(id) {
   const maxMs = currentPlayTrip.points[currentPlayTrip.points.length - 1].ts - currentPlayTrip.points[0].ts;
   playState = { playing: false, speed: 20, rafId: null, simTime: 0, lastFrameReal: 0, maxMs, renderFn: renderFrame, paceProfile };
   setSpeedButtons(20);
+  setUniformMode(uniformModeEnabled);
   document.getElementById('scrubber').max = maxMs;
   document.getElementById('scrubber').value = 0;
   renderFrame(0);
@@ -539,6 +561,7 @@ function renderFrame(simTime) {
   document.getElementById('readoutDist').textContent = fmtDistance(dist);
   document.getElementById('readoutSpeed').textContent = pos.speed ? (pos.speed * 3.6).toFixed(1) + ' km/h' : '\u2014';
   updatePaceBadge(simTime);
+  updateLivePhotoThumb(pos, simTime);
 }
 
 /* ---- holiday (multi-trip) playback ---- */
@@ -594,6 +617,7 @@ async function openHolidayPlayback(collectionId) {
 
   playState = { playing: false, speed: 20, rafId: null, simTime: 0, lastFrameReal: 0, maxMs, renderFn: renderHolidayFrame };
   setSpeedButtons(20);
+  setUniformMode(uniformModeEnabled);
   document.getElementById('scrubber').max = maxMs;
   document.getElementById('scrubber').value = 0;
   renderHolidayFrame(0);
@@ -638,6 +662,7 @@ function renderHolidayFrame(simTime) {
   document.getElementById('readoutDist').textContent = fmtDistance(totalDist);
   document.getElementById('readoutSpeed').textContent = pos.speed ? (pos.speed * 3.6).toFixed(1) + ' km/h' : '\u2014';
   updatePaceBadge(simTime);
+  updateLivePhotoThumb(pos, simTime);
 }
 
 /* ---- shared playback controls ---- */
@@ -646,7 +671,8 @@ function playbackTick(nowReal) {
   const dtReal = nowReal - playState.lastFrameReal;
   playState.lastFrameReal = nowReal;
   const pace = currentPaceMultiplier(playState.simTime);
-  playState.simTime += dtReal * playState.speed * pace;
+  const base = currentBaseSpeed(playState.simTime);
+  playState.simTime += dtReal * base * pace;
   if (playState.simTime >= playState.maxMs) {
     playState.simTime = playState.maxMs;
     playState.renderFn(playState.simTime);
@@ -669,7 +695,14 @@ function pausePlayback() {
 }
 function setSpeedButtons(speed) {
   playState.speed = speed;
-  document.querySelectorAll('.speed-btn').forEach((b) => b.classList.toggle('active', Number(b.dataset.speed) === speed));
+  document.querySelectorAll('.speed-btn[data-speed]').forEach((b) => b.classList.toggle('active', Number(b.dataset.speed) === speed));
+}
+
+function setUniformMode(on) {
+  uniformModeEnabled = on;
+  document.getElementById('uniformSpeedBtn').classList.toggle('active', on);
+  if (on) document.querySelectorAll('.speed-btn[data-speed]').forEach((b) => b.classList.remove('active'));
+  else setSpeedButtons(playState.speed);
 }
 
 function updatePaceBadge(simTime) {
@@ -702,10 +735,12 @@ function photoSimTime(photo) {
 async function loadPhotoPins(tripIds, preloaded) {
   photoMarkers.forEach((m) => playbackMap.removeLayer(m));
   photoMarkers = [];
+  photoEntries = [];
   const all = preloaded || (await dbGetAllStore('photos'));
   const mine = all.filter((p) => tripIds.includes(p.tripId));
   for (const photo of mine) {
     const url = URL.createObjectURL(photo.blob);
+    photoEntries.push({ photo, url });
     const icon = L.divIcon({
       className: 'photo-pin',
       html: `<div class="photo-pin-thumb" style="background-image:url('${url}')"></div>`,
@@ -722,6 +757,47 @@ async function loadPhotoPins(tripIds, preloaded) {
       openPhotoLightbox(photo, url);
     });
     photoMarkers.push(marker);
+  }
+}
+
+/* ---- live photo callout: surfaces the nearest photo right alongside the moving marker ---- */
+function nearestPhotoEntryAt(simTime) {
+  let best = null, bestDist = Infinity;
+  for (const entry of photoEntries) {
+    const st = photoSimTime(entry.photo);
+    if (st == null) continue;
+    const dist = Math.abs(st - simTime);
+    if (dist < bestDist) { bestDist = dist; best = entry; }
+  }
+  return best && bestDist <= PHOTO_RADIUS_MS ? best : null;
+}
+
+function updateLivePhotoThumb(pos, simTime) {
+  const nearest = nearestPhotoEntryAt(simTime);
+  if (!nearest) {
+    if (liveThumbMarker) { playbackMap.removeLayer(liveThumbMarker); liveThumbMarker = null; liveThumbPhotoId = null; }
+    return;
+  }
+  if (!liveThumbMarker) {
+    const icon = L.divIcon({
+      className: 'live-photo-thumb',
+      html: `<div class="live-photo-thumb-inner" style="background-image:url('${nearest.url}')"></div>`,
+      iconSize: [46, 46],
+      iconAnchor: [23, 66],
+    });
+    liveThumbMarker = L.marker([pos.lat, pos.lng], { icon, interactive: false }).addTo(playbackMap);
+    liveThumbPhotoId = nearest.photo.id;
+    return;
+  }
+  liveThumbMarker.setLatLng([pos.lat, pos.lng]);
+  if (liveThumbPhotoId !== nearest.photo.id) {
+    liveThumbMarker.setIcon(L.divIcon({
+      className: 'live-photo-thumb',
+      html: `<div class="live-photo-thumb-inner" style="background-image:url('${nearest.url}')"></div>`,
+      iconSize: [46, 46],
+      iconAnchor: [23, 66],
+    }));
+    liveThumbPhotoId = nearest.photo.id;
   }
 }
 
@@ -1173,9 +1249,10 @@ window.addEventListener('DOMContentLoaded', () => {
     playState.renderFn(playState.simTime);
   });
 
-  document.querySelectorAll('.speed-btn').forEach((b) => {
-    b.addEventListener('click', () => setSpeedButtons(Number(b.dataset.speed)));
+  document.querySelectorAll('.speed-btn[data-speed]').forEach((b) => {
+    b.addEventListener('click', () => { setSpeedButtons(Number(b.dataset.speed)); setUniformMode(false); });
   });
+  document.getElementById('uniformSpeedBtn').addEventListener('click', () => setUniformMode(!uniformModeEnabled));
 
   document.getElementById('deleteTripBtn').addEventListener('click', async () => {
     if (currentHoliday) {
