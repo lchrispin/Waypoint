@@ -416,8 +416,8 @@ function buildPaceProfile(points, photosForTrip, simOffset) {
   const intervals = [];
   for (let i = 1; i < n; i++) {
     let base = 1;
-    if (localSpeed[i] < 0.3) base = 3; // stationary/parked — fast-forward through it
-    else if (localSpeed[i] > 4) base = 1.4; // steady, uneventful travel
+    if (localSpeed[i] < 0.3) base = 1.8; // stationary/parked — fast-forward through it
+    else if (localSpeed[i] > 4) base = 1.15; // steady, uneventful travel
     intervals.push({ start: points[i - 1].ts - simOffset, end: points[i].ts - simOffset, base });
   }
 
@@ -431,7 +431,7 @@ function buildPaceProfile(points, photosForTrip, simOffset) {
     let diff = Math.abs(b2 - b1) % 360;
     if (diff > 180) diff = 360 - diff;
     if (diff > 20) {
-      dips.push({ sim: points[i].ts - simOffset, strength: Math.min(1, diff / 90) * 0.6, radius: TURN_RADIUS_MS });
+      dips.push({ sim: points[i].ts - simOffset, strength: Math.min(1, diff / 90) * 0.3, radius: TURN_RADIUS_MS });
     }
   }
   for (const photo of photosForTrip) {
@@ -444,7 +444,7 @@ function buildPaceProfile(points, photosForTrip, simOffset) {
       const diff = Math.abs(mts - photo.ts);
       if (diff < best) { best = diff; nearestTs = points[i].ts; }
     }
-    dips.push({ sim: nearestTs - simOffset, strength: 0.65, radius: PHOTO_RADIUS_MS });
+    dips.push({ sim: nearestTs - simOffset, strength: 0.35, radius: PHOTO_RADIUS_MS });
   }
 
   return { intervals, dips };
@@ -469,7 +469,7 @@ function paceMultiplierAt(profile, simCoord) {
 function currentPaceMultiplier(simTime) {
   if (currentHoliday) {
     const leg = legAtSimTime(simTime);
-    if (!leg) return 3.5; // synthetic gap between legs — nothing to see, fast-forward through it
+    if (!leg) return 2; // synthetic gap between legs — nothing to see, fast-forward through it
     return paceMultiplierAt(leg.paceProfile, simTime);
   }
   return paceMultiplierAt(playState.paceProfile, simTime);
@@ -520,22 +520,28 @@ function setupPlaybackMap(legsForGhost) {
 
 /* ---- auto-follow camera: zoom based on how much ground is covered in the next few seconds,
  * so a fast leg (flight/highway) doesn't fly off-screen and a slow one isn't zoomed out to nothing ---- */
-const FOLLOW_LOOKAHEAD_MS = 15000;
-const FOLLOW_ZOOM_SMOOTHING = 0.08;
+const FOLLOW_LOOKAHEAD_MS = 30000;
+const FOLLOW_ZOOM_SMOOTHING = 0.025;
+const FOLLOW_MAX_ZOOM_STEP = 0.05;
 
 function computeTargetZoom(pos, aheadPos) {
   const spanMeters = Math.max(30, haversine(pos, aheadPos));
   const size = playbackMap.getSize ? playbackMap.getSize() : { x: 360, y: 640 };
   const minDim = Math.max(100, Math.min(size.x, size.y));
-  const metersPerPixel = spanMeters / (minDim * 0.45);
+  const metersPerPixel = spanMeters / (minDim * 0.3);
   const latRad = (pos.lat * Math.PI) / 180;
   const zoom = Math.log2((156543.03392 * Math.cos(latRad)) / metersPerPixel);
-  return Math.min(18, Math.max(3, zoom));
+  return Math.min(16, Math.max(7, zoom));
 }
 
 function updateAutoFollow(pos, aheadPos) {
   const target = computeTargetZoom(pos, aheadPos);
-  autoZoomCurrent = autoZoomCurrent == null ? target : autoZoomCurrent + (target - autoZoomCurrent) * FOLLOW_ZOOM_SMOOTHING;
+  if (autoZoomCurrent == null) {
+    autoZoomCurrent = target;
+  } else {
+    const step = (target - autoZoomCurrent) * FOLLOW_ZOOM_SMOOTHING;
+    autoZoomCurrent += Math.max(-FOLLOW_MAX_ZOOM_STEP, Math.min(FOLLOW_MAX_ZOOM_STEP, step));
+  }
   playbackMap.setView([pos.lat, pos.lng], autoZoomCurrent);
 }
 
