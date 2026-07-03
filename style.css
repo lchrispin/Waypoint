@@ -371,6 +371,20 @@ html, body {
 }
 .fab-combine:disabled { opacity: 0.4; }
 
+.select-actions {
+  position: fixed;
+  left: 0; right: 0; bottom: 0;
+  display: flex;
+  gap: 10px;
+  padding: 14px 20px 22px;
+  background: var(--navy);
+  border-top: 1px solid var(--line);
+}
+.select-actions button { flex: 1; white-space: nowrap; }
+.select-actions button:disabled { opacity: 0.4; cursor: default; }
+.btn-teal { background: var(--teal); color: var(--paper); }
+.btn-danger-ghost { color: var(--danger); border-color: var(--danger); }
+
 /* ---------- holiday leg banner ---------- */
 .leg-banner {
   position: absolute;

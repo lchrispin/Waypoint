@@ -32,7 +32,11 @@
       <div id="tripList"></div>
     </div>
     <button id="fabRecord" class="fab">+ Record trip</button>
-    <button id="fabCombine" class="fab fab-combine" style="display:none;" disabled>Combine (0)</button>
+    <div id="selectActionsBar" class="select-actions" style="display:none;">
+      <button id="bulkDeleteBtn" class="btn-ghost btn-danger-ghost" disabled>Delete</button>
+      <button id="mergeBtn" class="btn-primary btn-teal" disabled>Merge (0)</button>
+      <button id="fabCombine" class="btn-primary" disabled>Combine (0)</button>
+    </div>
     <input type="file" id="timelineFileInput" accept="application/json,.json" style="display:none" />
   </div>
 
@@ -59,7 +63,10 @@
     <div class="topbar">
       <button id="playbackBackBtn" class="back-btn">&#8592;</button>
       <div class="wordmark" id="playbackTitle" style="color:var(--paper); text-transform:none; font-size:14px;">Trip</div>
-      <button id="deleteTripBtn" class="icon-btn">Delete</button>
+      <div style="display:flex; gap:8px;">
+        <button id="renameTripBtn" class="icon-btn">Rename</button>
+        <button id="deleteTripBtn" class="icon-btn">Delete</button>
+      </div>
     </div>
     <div id="playbackMap"></div>
     <div id="legBanner" class="leg-banner"></div>
@@ -144,6 +151,30 @@
     <div class="modal-row">
       <button id="cancelHolidayName" class="btn-ghost">Cancel</button>
       <button id="confirmHolidayName" class="btn-primary">Combine trips</button>
+    </div>
+  </div>
+</div>
+
+<!-- ===== merge naming modal ===== -->
+<div id="mergeNameModal" class="modal-backdrop">
+  <div class="modal-sheet">
+    <h2>Name the merged trip</h2>
+    <input type="text" id="mergeNameInput" placeholder="e.g. Coast drive" />
+    <div class="modal-row">
+      <button id="cancelMergeName" class="btn-ghost">Cancel</button>
+      <button id="confirmMergeName" class="btn-primary">Merge trips</button>
+    </div>
+  </div>
+</div>
+
+<!-- ===== rename modal (trip or holiday) ===== -->
+<div id="renameModal" class="modal-backdrop">
+  <div class="modal-sheet">
+    <h2 id="renameModalTitle">Rename</h2>
+    <input type="text" id="renameInput" />
+    <div class="modal-row">
+      <button id="cancelRename" class="btn-ghost">Cancel</button>
+      <button id="confirmRename" class="btn-primary">Save</button>
     </div>
   </div>
 </div>
