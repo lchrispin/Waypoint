@@ -188,7 +188,7 @@ html, body {
   margin-bottom: 12px;
 }
 
-.playback-buttons { display: flex; align-items: center; gap: 10px; }
+.playback-buttons { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 
 .play-toggle {
   background: var(--amber);
@@ -339,6 +339,99 @@ html, body {
 .loading-wrap p { font-family: var(--font-data); font-size: 13px; }
 
 @keyframes spin { from { transform: rotate(0deg);} to { transform: rotate(360deg);} }
+
+/* ---------- select mode / holidays ---------- */
+.section-heading {
+  font-family: var(--font-data);
+  font-size: 11px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--paper-dim);
+  margin: 18px 0 10px;
+}
+.section-heading:first-child { margin-top: 0; }
+
+.trip-card.selectable {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  cursor: pointer;
+}
+.trip-card.selectable input[type="checkbox"] {
+  width: 20px; height: 20px;
+  accent-color: var(--amber);
+  margin-top: 2px;
+  flex-shrink: 0;
+}
+
+.fab-combine {
+  background: var(--teal);
+  color: var(--paper);
+  box-shadow: 0 8px 24px rgba(58,107,114,0.35);
+}
+.fab-combine:disabled { opacity: 0.4; }
+
+/* ---------- holiday leg banner ---------- */
+.leg-banner {
+  position: absolute;
+  top: 66px;
+  left: 50%;
+  transform: translateX(-50%) translateY(-8px);
+  background: rgba(15,27,42,0.88);
+  border: 1px solid var(--line);
+  color: var(--amber);
+  font-family: var(--font-data);
+  font-size: 12.5px;
+  padding: 8px 16px;
+  border-radius: 999px;
+  white-space: nowrap;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.25s ease, transform 0.25s ease;
+  z-index: 500;
+}
+.leg-banner.active { opacity: 1; transform: translateX(-50%) translateY(0); }
+
+/* ---------- photo pins + lightbox ---------- */
+.photo-btn { flex-shrink: 0; padding: 12px 14px; }
+
+.photo-pin-thumb {
+  width: 34px; height: 34px;
+  border-radius: 50%;
+  border: 2.5px solid var(--amber);
+  background-size: cover;
+  background-position: center;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.4);
+}
+
+.lightbox-sheet { padding-top: 16px; }
+.lightbox-sheet img {
+  width: 100%;
+  max-height: 50vh;
+  object-fit: contain;
+  border-radius: 10px;
+  background: var(--navy);
+  margin-bottom: 10px;
+}
+.lightbox-meta {
+  font-family: var(--font-data);
+  font-size: 12px;
+  color: var(--amber);
+  margin-bottom: 14px;
+}
+
+.road-tag {
+  font-size: 9.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--teal);
+  background: rgba(58,107,114,0.2);
+  padding: 2px 6px;
+  border-radius: 5px;
+  margin-left: 6px;
+  font-family: var(--font-ui);
+  font-weight: 600;
+}
 
 @media (prefers-reduced-motion: reduce) {
   * { transition: none !important; animation: none !important; }

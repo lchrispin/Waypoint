@@ -22,12 +22,17 @@
   <div id="view-home" class="view active">
     <div class="topbar">
       <div class="wordmark">Waypoint<span class="dot"> · trips</span></div>
-      <button id="importBtn" class="icon-btn">Import</button>
+      <div style="display:flex; gap:8px;">
+        <button id="selectModeBtn" class="icon-btn">Select</button>
+        <button id="importBtn" class="icon-btn">Import</button>
+      </div>
     </div>
     <div class="content">
+      <div id="holidayList"></div>
       <div id="tripList"></div>
     </div>
     <button id="fabRecord" class="fab">+ Record trip</button>
+    <button id="fabCombine" class="fab fab-combine" style="display:none;" disabled>Combine (0)</button>
     <input type="file" id="timelineFileInput" accept="application/json,.json" style="display:none" />
   </div>
 
@@ -57,6 +62,7 @@
       <button id="deleteTripBtn" class="icon-btn">Delete</button>
     </div>
     <div id="playbackMap"></div>
+    <div id="legBanner" class="leg-banner"></div>
     <div class="playback-panel">
       <div class="readout">
         <span id="readoutClock">--:--</span>
@@ -72,8 +78,10 @@
           <button class="speed-btn" data-speed="60">60x</button>
           <button class="speed-btn" data-speed="200">200x</button>
         </div>
+        <button id="addPhotoBtn" class="icon-btn photo-btn">+ Photo</button>
       </div>
     </div>
+    <input type="file" id="photoFileInput" accept="image/*" multiple style="display:none" />
   </div>
 
   <!-- ===== TIMELINE: DATE RANGE ===== -->
@@ -124,6 +132,30 @@
     <div class="modal-row">
       <button id="cancelName" class="btn-ghost">Cancel</button>
       <button id="confirmName" class="btn-primary">Start recording</button>
+    </div>
+  </div>
+</div>
+
+<!-- ===== holiday naming modal ===== -->
+<div id="holidayNameModal" class="modal-backdrop">
+  <div class="modal-sheet">
+    <h2>Name this holiday</h2>
+    <input type="text" id="holidayNameInput" placeholder="e.g. Italy 2026" />
+    <div class="modal-row">
+      <button id="cancelHolidayName" class="btn-ghost">Cancel</button>
+      <button id="confirmHolidayName" class="btn-primary">Combine trips</button>
+    </div>
+  </div>
+</div>
+
+<!-- ===== photo lightbox ===== -->
+<div id="photoLightbox" class="modal-backdrop">
+  <div class="modal-sheet lightbox-sheet">
+    <img id="lightboxImg" alt="Trip photo" />
+    <div id="lightboxMeta" class="lightbox-meta"></div>
+    <div class="modal-row">
+      <button id="lightboxDeleteBtn" class="btn-ghost">Delete photo</button>
+      <button id="lightboxCloseBtn" class="btn-primary">Close</button>
     </div>
   </div>
 </div>
