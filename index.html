@@ -1,0 +1,134 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no" />
+<title>Waypoint — Trip Tracker</title>
+<link rel="manifest" href="manifest.json" />
+<meta name="theme-color" content="#0F1B2A" />
+<link rel="apple-touch-icon" href="icon-192.png" />
+<link rel="icon" href="icon-192.png" />
+
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&family=Space+Mono&display=swap" rel="stylesheet" />
+
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css" />
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<div id="app">
+
+  <!-- ===== HOME ===== -->
+  <div id="view-home" class="view active">
+    <div class="topbar">
+      <div class="wordmark">Waypoint<span class="dot"> · trips</span></div>
+      <button id="importBtn" class="icon-btn">Import</button>
+    </div>
+    <div class="content">
+      <div id="tripList"></div>
+    </div>
+    <button id="fabRecord" class="fab">+ Record trip</button>
+    <input type="file" id="timelineFileInput" accept="application/json,.json" style="display:none" />
+  </div>
+
+  <!-- ===== RECORD ===== -->
+  <div id="view-record" class="view">
+    <div class="topbar">
+      <button id="recordBackBtn" class="back-btn">&#8592;</button>
+      <div class="wordmark">Recording<span class="dot">&#8230;</span></div>
+      <span style="width:20px"></span>
+    </div>
+    <div id="recordMap"></div>
+    <div class="stat-strip">
+      <div class="stat"><div class="stat-label">Elapsed</div><div class="stat-value" id="statElapsed">0:00</div></div>
+      <div class="stat"><div class="stat-label">Distance</div><div class="stat-value" id="statDistance">0 m</div></div>
+      <div class="stat"><div class="stat-label">Points</div><div class="stat-value" id="statPoints">0</div></div>
+    </div>
+    <div class="record-controls">
+      <button id="stopRecordBtn" class="btn-stop">Stop &amp; save trip</button>
+    </div>
+  </div>
+
+  <!-- ===== PLAYBACK ===== -->
+  <div id="view-playback" class="view">
+    <div class="topbar">
+      <button id="playbackBackBtn" class="back-btn">&#8592;</button>
+      <div class="wordmark" id="playbackTitle" style="color:var(--paper); text-transform:none; font-size:14px;">Trip</div>
+      <button id="deleteTripBtn" class="icon-btn">Delete</button>
+    </div>
+    <div id="playbackMap"></div>
+    <div class="playback-panel">
+      <div class="readout">
+        <span id="readoutClock">--:--</span>
+        <span id="readoutDist">0 m</span>
+        <span id="readoutSpeed">—</span>
+      </div>
+      <input type="range" id="scrubber" class="scrubber" min="0" max="100" value="0" />
+      <div class="playback-buttons">
+        <button id="playToggle" class="play-toggle">&#9654;</button>
+        <div class="speed-select">
+          <button class="speed-btn" data-speed="5">5x</button>
+          <button class="speed-btn active" data-speed="20">20x</button>
+          <button class="speed-btn" data-speed="60">60x</button>
+          <button class="speed-btn" data-speed="200">200x</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===== TIMELINE: DATE RANGE ===== -->
+  <div id="view-daterange" class="view">
+    <div class="topbar">
+      <button id="dateRangeBackBtn" class="back-btn">&#8592;</button>
+      <div class="wordmark">Import Timeline</div>
+      <span style="width:20px"></span>
+    </div>
+    <div class="content">
+      <p class="import-hint">Your file covers <span id="timelineSpan"></span>. Pick a window to search for trips — smaller ranges load faster.</p>
+      <label class="field-label">From</label>
+      <input type="date" id="rangeStart" class="date-input" />
+      <label class="field-label">To</label>
+      <input type="date" id="rangeEnd" class="date-input" />
+      <button id="findTripsBtn" class="btn-primary" style="width:100%; margin-top:20px;">Find trips</button>
+    </div>
+  </div>
+
+  <!-- ===== TIMELINE: CANDIDATE LIST ===== -->
+  <div id="view-import-list" class="view">
+    <div class="topbar">
+      <button id="importListBackBtn" class="back-btn">&#8592;</button>
+      <div class="wordmark">Select trips</div>
+      <button id="selectAllBtn" class="icon-btn">Select all</button>
+    </div>
+    <div class="content">
+      <div id="candidateList"></div>
+    </div>
+    <button id="importSelectedBtn" class="fab">Import selected (0)</button>
+  </div>
+
+  <!-- ===== LOADING ===== -->
+  <div id="view-loading" class="view">
+    <div class="loading-wrap">
+      <div class="loading-glyph">&#9737;</div>
+      <p id="loadingMessage">Reading Timeline file&#8230;</p>
+    </div>
+  </div>
+
+</div>
+
+<!-- ===== naming modal ===== -->
+<div id="nameModal" class="modal-backdrop">
+  <div class="modal-sheet">
+    <h2>Name this trip</h2>
+    <input type="text" id="tripNameInput" placeholder="e.g. Coast drive" />
+    <div class="modal-row">
+      <button id="cancelName" class="btn-ghost">Cancel</button>
+      <button id="confirmName" class="btn-primary">Start recording</button>
+    </div>
+  </div>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
