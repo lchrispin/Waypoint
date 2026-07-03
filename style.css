@@ -182,6 +182,14 @@ html, body {
   margin-bottom: 10px;
 }
 
+.pace-badge {
+  font-size: 11px;
+  color: var(--paper-dim);
+  align-self: center;
+}
+.pace-badge.slow { color: var(--amber); }
+.pace-badge.fast { color: var(--teal); }
+
 .scrubber {
   width: 100%;
   accent-color: var(--amber);

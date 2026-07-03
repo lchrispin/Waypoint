@@ -63,6 +63,12 @@ function pathDistance(points) {
   for (let i = 1; i < points.length; i++) d += haversine(points[i - 1], points[i]);
   return d;
 }
+function bearing(a, b) {
+  const toRad = (d) => (d * Math.PI) / 180;
+  const y = Math.sin(toRad(b.lng - a.lng)) * Math.cos(toRad(b.lat));
+  const x = Math.cos(toRad(a.lat)) * Math.sin(toRad(b.lat)) - Math.sin(toRad(a.lat)) * Math.cos(toRad(b.lat)) * Math.cos(toRad(b.lng - a.lng));
+  return ((Math.atan2(y, x) * 180) / Math.PI + 360) % 360;
+}
 function fmtDistance(m) {
   return m >= 1000 ? (m / 1000).toFixed(2) + ' km' : Math.round(m) + ' m';
 }
@@ -382,6 +388,87 @@ function pointAtSimTime(points, simTime) {
   return { idx: points.length - 1, pos: points[points.length - 1] };
 }
 
+/* ---- adaptive playback pace: slow near photos/turns, fast through stationary or steady stretches ----
+ * Local speed describes a whole point-to-point interval, so it's stored as a flat "base" multiplier
+ * spanning that interval (a stop is fast-forwarded evenly for its whole duration, however long).
+ * Turns and photos are momentary, so they're stored as smooth time-radius "dips" layered on top. */
+const TURN_RADIUS_MS = 20000;
+const PHOTO_RADIUS_MS = 45000;
+
+function buildPaceProfile(points, photosForTrip, simOffset) {
+  const n = points.length;
+  if (n < 2) return { intervals: [{ start: -Infinity, end: Infinity, base: 1 }], dips: [] };
+
+  const segDist = new Array(n).fill(0);
+  const localSpeed = new Array(n).fill(0);
+  for (let i = 1; i < n; i++) {
+    const dt = (points[i].ts - points[i - 1].ts) / 1000;
+    segDist[i] = haversine(points[i - 1], points[i]);
+    localSpeed[i] = dt > 0 ? segDist[i] / dt : 0;
+  }
+
+  const intervals = [];
+  for (let i = 1; i < n; i++) {
+    let base = 1;
+    if (localSpeed[i] < 0.3) base = 3; // stationary/parked — fast-forward through it
+    else if (localSpeed[i] > 4) base = 1.4; // steady, uneventful travel
+    intervals.push({ start: points[i - 1].ts - simOffset, end: points[i].ts - simOffset, base });
+  }
+
+  const dips = [];
+  for (let i = 1; i < n - 1; i++) {
+    // bearing across a near-zero-distance segment is just GPS noise, not a real heading —
+    // require real displacement on both sides before trusting the bearing comparison
+    if (segDist[i] < 3 || segDist[i + 1] < 3) continue;
+    const b1 = bearing(points[i - 1], points[i]);
+    const b2 = bearing(points[i], points[i + 1]);
+    let diff = Math.abs(b2 - b1) % 360;
+    if (diff > 180) diff = 360 - diff;
+    if (diff > 20) {
+      dips.push({ sim: points[i].ts - simOffset, strength: Math.min(1, diff / 90) * 0.6, radius: TURN_RADIUS_MS });
+    }
+  }
+  for (const photo of photosForTrip) {
+    // anchor on the matching point's own ts (already in this points array's coordinate domain —
+    // absolute epoch for a single trip, synthetic holiday-timeline ms for a leg) rather than the
+    // photo's raw real-world timestamp, which lives in a different domain for holiday legs.
+    let nearestTs = points[0].ts, best = Infinity;
+    for (let i = 0; i < n; i++) {
+      const mts = points[i].realTs != null ? points[i].realTs : points[i].ts;
+      const diff = Math.abs(mts - photo.ts);
+      if (diff < best) { best = diff; nearestTs = points[i].ts; }
+    }
+    dips.push({ sim: nearestTs - simOffset, strength: 0.65, radius: PHOTO_RADIUS_MS });
+  }
+
+  return { intervals, dips };
+}
+
+function paceMultiplierAt(profile, simCoord) {
+  if (!profile) return 1;
+  let base = 1;
+  for (const iv of profile.intervals) {
+    if (simCoord >= iv.start && simCoord <= iv.end) { base = iv.base; break; }
+  }
+  let mult = base;
+  for (const d of profile.dips) {
+    const dist = Math.abs(simCoord - d.sim);
+    if (dist >= d.radius) continue;
+    const falloff = 1 - dist / d.radius;
+    mult = Math.min(mult, 1 - falloff * d.strength);
+  }
+  return mult;
+}
+
+function currentPaceMultiplier(simTime) {
+  if (currentHoliday) {
+    const leg = legAtSimTime(simTime);
+    if (!leg) return 3.5; // synthetic gap between legs — nothing to see, fast-forward through it
+    return paceMultiplierAt(leg.paceProfile, simTime);
+  }
+  return paceMultiplierAt(playState.paceProfile, simTime);
+}
+
 function setupPlaybackMap(legsForGhost) {
   if (playbackMap) { playbackMap.remove(); playbackMap = null; }
   playbackMap = L.map('playbackMap', { zoomControl: false }).setView([20, 0], 3);
@@ -420,14 +507,18 @@ async function openPlayback(id) {
   showView('playback');
   setupPlaybackMap([{ points: currentPlayTrip.points }]);
 
+  const allPhotos = await dbGetAllStore('photos');
+  const tripPhotos = allPhotos.filter((p) => p.tripId === currentPlayTrip.id);
+  const paceProfile = buildPaceProfile(currentPlayTrip.points, tripPhotos, currentPlayTrip.points[0].ts);
+
   const maxMs = currentPlayTrip.points[currentPlayTrip.points.length - 1].ts - currentPlayTrip.points[0].ts;
-  playState = { playing: false, speed: 20, rafId: null, simTime: 0, lastFrameReal: 0, maxMs, renderFn: renderFrame };
+  playState = { playing: false, speed: 20, rafId: null, simTime: 0, lastFrameReal: 0, maxMs, renderFn: renderFrame, paceProfile };
   setSpeedButtons(20);
   document.getElementById('scrubber').max = maxMs;
   document.getElementById('scrubber').value = 0;
   renderFrame(0);
   document.getElementById('playToggle').textContent = '\u25B6';
-  await loadPhotoPins([currentPlayTrip.id]);
+  await loadPhotoPins([currentPlayTrip.id], allPhotos);
 }
 
 function renderFrame(simTime) {
@@ -447,6 +538,7 @@ function renderFrame(simTime) {
   document.getElementById('readoutClock').textContent = fmtClock(pos.ts);
   document.getElementById('readoutDist').textContent = fmtDistance(dist);
   document.getElementById('readoutSpeed').textContent = pos.speed ? (pos.speed * 3.6).toFixed(1) + ' km/h' : '\u2014';
+  updatePaceBadge(simTime);
 }
 
 /* ---- holiday (multi-trip) playback ---- */
@@ -490,6 +582,12 @@ async function openHolidayPlayback(collectionId) {
   currentHoliday = { collection, legs };
   currentPlayTrip = null;
 
+  const allPhotos = await dbGetAllStore('photos');
+  legs.forEach((leg) => {
+    const legPhotos = allPhotos.filter((p) => p.tripId === leg.tripId);
+    leg.paceProfile = buildPaceProfile(leg.points, legPhotos, 0);
+  });
+
   document.getElementById('playbackTitle').textContent = collection.name;
   showView('playback');
   setupPlaybackMap(legs);
@@ -500,7 +598,7 @@ async function openHolidayPlayback(collectionId) {
   document.getElementById('scrubber').value = 0;
   renderHolidayFrame(0);
   document.getElementById('playToggle').textContent = '\u25B6';
-  await loadPhotoPins(tripList.map((t) => t.id));
+  await loadPhotoPins(tripList.map((t) => t.id), allPhotos);
 }
 
 function legAtSimTime(simTime) {
@@ -539,6 +637,7 @@ function renderHolidayFrame(simTime) {
   document.getElementById('readoutClock').textContent = fmtClock(pos.realTs ?? pos.ts);
   document.getElementById('readoutDist').textContent = fmtDistance(totalDist);
   document.getElementById('readoutSpeed').textContent = pos.speed ? (pos.speed * 3.6).toFixed(1) + ' km/h' : '\u2014';
+  updatePaceBadge(simTime);
 }
 
 /* ---- shared playback controls ---- */
@@ -546,7 +645,8 @@ function playbackTick(nowReal) {
   if (!playState.playing) return;
   const dtReal = nowReal - playState.lastFrameReal;
   playState.lastFrameReal = nowReal;
-  playState.simTime += dtReal * playState.speed;
+  const pace = currentPaceMultiplier(playState.simTime);
+  playState.simTime += dtReal * playState.speed * pace;
   if (playState.simTime >= playState.maxMs) {
     playState.simTime = playState.maxMs;
     playState.renderFn(playState.simTime);
@@ -572,6 +672,21 @@ function setSpeedButtons(speed) {
   document.querySelectorAll('.speed-btn').forEach((b) => b.classList.toggle('active', Number(b.dataset.speed) === speed));
 }
 
+function updatePaceBadge(simTime) {
+  const pace = currentPaceMultiplier(simTime);
+  const badge = document.getElementById('paceBadge');
+  if (pace < 0.85) {
+    badge.textContent = 'Slowing · photo/turn';
+    badge.className = 'pace-badge slow';
+  } else if (pace > 1.2) {
+    badge.textContent = 'Fast-forwarding';
+    badge.className = 'pace-badge fast';
+  } else {
+    badge.textContent = '';
+    badge.className = 'pace-badge';
+  }
+}
+
 /* ---- photos ---- */
 function photoSimTime(photo) {
   if (currentHoliday) {
@@ -584,10 +699,10 @@ function photoSimTime(photo) {
   return null;
 }
 
-async function loadPhotoPins(tripIds) {
+async function loadPhotoPins(tripIds, preloaded) {
   photoMarkers.forEach((m) => playbackMap.removeLayer(m));
   photoMarkers = [];
-  const all = await dbGetAllStore('photos');
+  const all = preloaded || (await dbGetAllStore('photos'));
   const mine = all.filter((p) => tripIds.includes(p.tripId));
   for (const photo of mine) {
     const url = URL.createObjectURL(photo.blob);
@@ -619,6 +734,151 @@ function currentPlaybackPosition() {
   }
   const { pos } = pointAtSimTime(currentPlayTrip.points, playState.simTime);
   return { lat: pos.lat, lng: pos.lng, ts: pos.ts, tripId: currentPlayTrip.id };
+}
+
+/* ---- EXIF: place a photo by its own GPS/timestamp instead of the scrubber position ---- */
+function readExifGps(file) {
+  return new Promise((resolve) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      try { resolve(parseExif(reader.result)); } catch (e) { resolve(null); }
+    };
+    reader.onerror = () => resolve(null);
+    reader.readAsArrayBuffer(file.slice(0, 128 * 1024)); // EXIF lives in the first few KB
+  });
+}
+
+function parseExif(buf) {
+  const view = new DataView(buf);
+  if (view.getUint16(0) !== 0xffd8) return null;
+  let offset = 2;
+  while (offset < view.byteLength - 4) {
+    const marker = view.getUint16(offset);
+    if (marker === 0xffe1) {
+      const exifStart = offset + 4;
+      if (view.getUint32(exifStart) !== 0x45786966) { offset += 2 + view.getUint16(offset + 2); continue; }
+      return parseTiff(view, exifStart + 6);
+    }
+    if ((marker & 0xff00) !== 0xff00) break;
+    offset += 2 + view.getUint16(offset + 2);
+  }
+  return null;
+}
+
+function parseTiff(view, tiffStart) {
+  const little = view.getUint16(tiffStart) === 0x4949;
+  const u16 = (o) => view.getUint16(o, little);
+  const u32 = (o) => view.getUint32(o, little);
+  const typeSize = (t) => ({ 1: 1, 2: 1, 3: 2, 4: 4, 5: 8, 7: 1, 9: 4, 10: 8 }[t] || 1);
+
+  function readIfd(ifdOffset) {
+    const count = u16(ifdOffset);
+    const entries = {};
+    for (let i = 0; i < count; i++) {
+      const eo = ifdOffset + 2 + i * 12;
+      entries[u16(eo)] = { type: u16(eo + 2), numValues: u32(eo + 4), valueOffset: eo + 8 };
+    }
+    return entries;
+  }
+  function readValue(entry) {
+    const size = typeSize(entry.type) * entry.numValues;
+    const base = size > 4 ? tiffStart + u32(entry.valueOffset) : entry.valueOffset;
+    if (entry.type === 2) {
+      let s = '';
+      for (let i = 0; i < entry.numValues - 1; i++) s += String.fromCharCode(view.getUint8(base + i));
+      return s;
+    }
+    if (entry.type === 5) {
+      const out = [];
+      for (let i = 0; i < entry.numValues; i++) {
+        const num = u32(base + i * 8), den = u32(base + i * 8 + 4);
+        out.push(den ? num / den : 0);
+      }
+      return out;
+    }
+    if (entry.type === 3) return u16(base);
+    if (entry.type === 4) return u32(base);
+    return null;
+  }
+
+  const ifd0 = readIfd(tiffStart + u32(tiffStart + 4));
+  let dateTimeOriginal = null;
+  if (ifd0[0x0132]) dateTimeOriginal = readValue(ifd0[0x0132]);
+  if (ifd0[0x8769]) {
+    const subIfd = readIfd(tiffStart + readValue(ifd0[0x8769]));
+    if (subIfd[0x9003]) dateTimeOriginal = readValue(subIfd[0x9003]);
+  }
+
+  let lat = null, lng = null, gpsTs = null;
+  if (ifd0[0x8825]) {
+    const gps = readIfd(tiffStart + readValue(ifd0[0x8825]));
+    if (gps[1] && gps[2] && gps[3] && gps[4]) {
+      const latRef = readValue(gps[1]), latDms = readValue(gps[2]);
+      const lngRef = readValue(gps[3]), lngDms = readValue(gps[4]);
+      lat = (latDms[0] + latDms[1] / 60 + latDms[2] / 3600) * (latRef === 'S' ? -1 : 1);
+      lng = (lngDms[0] + lngDms[1] / 60 + lngDms[2] / 3600) * (lngRef === 'W' ? -1 : 1);
+    }
+    if (gps[29] && gps[7]) {
+      const dateStr = readValue(gps[29]);
+      const time = readValue(gps[7]);
+      const [y, mo, d] = dateStr.split(':').map(Number);
+      gpsTs = Date.UTC(y, mo - 1, d, time[0], time[1], Math.floor(time[2]));
+    }
+  }
+
+  let ts = gpsTs;
+  if (ts == null && dateTimeOriginal) {
+    const m = dateTimeOriginal.match(/(\d{4}):(\d{2}):(\d{2}) (\d{2}):(\d{2}):(\d{2})/);
+    if (m) ts = new Date(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +m[6]).getTime();
+  }
+
+  if (lat == null && ts == null) return null;
+  return { lat, lng, ts };
+}
+
+function interpolateByRealTs(points, targetTs) {
+  const key = (p) => (p.realTs != null ? p.realTs : p.ts);
+  if (targetTs <= key(points[0])) return points[0];
+  const last = points[points.length - 1];
+  if (targetTs >= key(last)) return last;
+  for (let i = 0; i < points.length - 1; i++) {
+    const a = points[i], b = points[i + 1];
+    if (key(a) <= targetTs && key(b) >= targetTs) {
+      const span = key(b) - key(a) || 1;
+      const f = (targetTs - key(a)) / span;
+      return { lat: a.lat + (b.lat - a.lat) * f, lng: a.lng + (b.lng - a.lng) * f };
+    }
+  }
+  return last;
+}
+
+async function resolvePhotoAnchor(file) {
+  const fallback = currentPlaybackPosition();
+  const exif = await readExifGps(file);
+  if (!exif || (exif.lat == null && exif.ts == null)) return fallback;
+
+  let tripId = fallback.tripId;
+  let points = currentHoliday ? null : currentPlayTrip.points;
+
+  if (currentHoliday && exif.ts != null) {
+    const BUFFER_MS = 10 * 60 * 1000;
+    const match = currentHoliday.legs.find((l) => {
+      const first = l.points[0].realTs, last = l.points[l.points.length - 1].realTs;
+      return exif.ts >= first - BUFFER_MS && exif.ts <= last + BUFFER_MS;
+    });
+    if (match) { tripId = match.tripId; points = match.points; }
+  }
+
+  let lat = exif.lat, lng = exif.lng;
+  if (lat == null && exif.ts != null && points) {
+    const pos = interpolateByRealTs(points, exif.ts);
+    lat = pos.lat;
+    lng = pos.lng;
+  }
+  if (lat == null) { lat = fallback.lat; lng = fallback.lng; }
+
+  const ts = exif.ts != null ? exif.ts : fallback.ts;
+  return { tripId, lat, lng, ts };
 }
 
 let lightboxPhoto = null;
@@ -1003,8 +1263,8 @@ window.addEventListener('DOMContentLoaded', () => {
     const files = [...e.target.files];
     e.target.value = '';
     if (files.length === 0) return;
-    const anchor = currentPlaybackPosition();
     for (const file of files) {
+      const anchor = await resolvePhotoAnchor(file);
       await dbPutStore('photos', {
         id: 'photo-' + Date.now() + '-' + Math.random().toString(36).slice(2),
         tripId: anchor.tripId, lat: anchor.lat, lng: anchor.lng, ts: anchor.ts, blob: file,
