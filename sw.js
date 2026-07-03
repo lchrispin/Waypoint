@@ -1,4 +1,4 @@
-const CACHE = 'waypoint-v2';
+const CACHE = 'waypoint-v3';
 const SHELL = ['./', './index.html', './style.css', './app.js', './manifest.json', './icon-192.png', './icon-512.png'];
 
 self.addEventListener('install', (e) => {
@@ -14,17 +14,13 @@ self.addEventListener('activate', (e) => {
 });
 
 self.addEventListener('fetch', (e) => {
-  // Network-first for map tiles/CDN, cache-first for app shell
-  const url = e.request.url;
-  if (url.includes('unpkg.com') || url.includes('tile.openstreetmap.org') || url.includes('fonts.g')) {
-    e.respondWith(
-      fetch(e.request).then((res) => {
-        const copy = res.clone();
-        caches.open(CACHE).then((c) => c.put(e.request, copy));
-        return res;
-      }).catch(() => caches.match(e.request))
-    );
-    return;
-  }
-  e.respondWith(caches.match(e.request).then((cached) => cached || fetch(e.request)));
+  // Network-first everywhere, including the app shell: a deploy should reach visitors on their very
+  // next load without depending on someone remembering to bump CACHE. Cache is only an offline fallback.
+  e.respondWith(
+    fetch(e.request).then((res) => {
+      const copy = res.clone();
+      caches.open(CACHE).then((c) => c.put(e.request, copy));
+      return res;
+    }).catch(() => caches.match(e.request))
+  );
 });
