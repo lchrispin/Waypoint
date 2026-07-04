@@ -618,14 +618,37 @@ html, body {
   pointer-events: auto;
   transform: translate(-50%, -50%) scale(1);
 }
+.photo-memory-frame {
+  overflow: hidden;
+  border-radius: 10px;
+}
 .photo-memory img {
   width: 100%;
   max-height: 38vh;
   object-fit: cover;
-  border-radius: 10px;
   background: var(--navy);
   display: block;
 }
+.photo-memory img.kenburns {
+  animation: kenburns 7s ease-out both;
+}
+@keyframes kenburns {
+  from { transform: scale(1); }
+  to { transform: scale(1.07) translate(-1.5%, -1%); }
+}
+.photo-memory-dots {
+  display: flex;
+  justify-content: center;
+  gap: 5px;
+  margin-top: 9px;
+}
+.photo-memory-dots:empty { display: none; }
+.photo-memory-dots span {
+  width: 6px; height: 6px;
+  border-radius: 50%;
+  background: var(--line);
+}
+.photo-memory-dots span.on { background: var(--amber); }
 .photo-memory-caption {
   font-family: var(--font-data);
   font-size: 12.5px;

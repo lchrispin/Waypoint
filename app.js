@@ -380,29 +380,36 @@ let followEnabled = false;
 let autoZoomCurrent = null;
 let playState = { playing: false, speed: 1, rafId: null, simTime: 0, lastFrameReal: 0, maxMs: 0, renderFn: null };
 
+/* binary search: the interpolators below run per animation frame on merged trips that can carry
+ * thousands of points, so a linear scan is the difference between smooth and stuttery */
+function lowerBoundIdx(points, target, key) {
+  let lo = 0, hi = points.length - 1;
+  while (hi - lo > 1) {
+    const mid = (lo + hi) >> 1;
+    if (key(points[mid]) <= target) lo = mid;
+    else hi = mid;
+  }
+  return lo;
+}
+
 function pointAtSimTime(points, simTime) {
-  const t0 = points[0].ts;
-  const target = t0 + simTime;
+  const target = points[0].ts + simTime;
   if (target <= points[0].ts) return { idx: 0, pos: points[0] };
   if (target >= points[points.length - 1].ts) return { idx: points.length - 1, pos: points[points.length - 1] };
-  for (let i = 0; i < points.length - 1; i++) {
-    if (points[i].ts <= target && points[i + 1].ts >= target) {
-      const a = points[i], b = points[i + 1];
-      const span = b.ts - a.ts || 1;
-      const f = (target - a.ts) / span;
-      return {
-        idx: i,
-        pos: {
-          lat: a.lat + (b.lat - a.lat) * f,
-          lng: a.lng + (b.lng - a.lng) * f,
-          speed: a.speed,
-          ts: target,
-          realTs: a.realTs != null ? a.realTs + (b.realTs - a.realTs) * f : target,
-        },
-      };
-    }
-  }
-  return { idx: points.length - 1, pos: points[points.length - 1] };
+  const i = lowerBoundIdx(points, target, (p) => p.ts);
+  const a = points[i], b = points[i + 1];
+  const span = b.ts - a.ts || 1;
+  const f = (target - a.ts) / span;
+  return {
+    idx: i,
+    pos: {
+      lat: a.lat + (b.lat - a.lat) * f,
+      lng: a.lng + (b.lng - a.lng) * f,
+      speed: a.speed,
+      ts: target,
+      realTs: a.realTs != null ? a.realTs + (b.realTs - a.realTs) * f : target,
+    },
+  };
 }
 
 /* ---- stay/jump detection + compressed display timeline ----
@@ -486,14 +493,10 @@ function synthTimeForRealTs(points, realTs) {
   if (realTs <= key(points[0])) return points[0].ts;
   const last = points[points.length - 1];
   if (realTs >= key(last)) return last.ts;
-  for (let i = 0; i < points.length - 1; i++) {
-    const a = points[i], b = points[i + 1];
-    if (key(a) <= realTs && key(b) >= realTs) {
-      const span = key(b) - key(a) || 1;
-      return a.ts + (b.ts - a.ts) * ((realTs - key(a)) / span);
-    }
-  }
-  return last.ts;
+  const i = lowerBoundIdx(points, realTs, key);
+  const a = points[i], b = points[i + 1];
+  const span = key(b) - key(a) || 1;
+  return a.ts + (b.ts - a.ts) * ((realTs - key(a)) / span);
 }
 
 function eventAtSimTime(simTime) {
@@ -1346,6 +1349,7 @@ function startPlayback() {
   playState.playing = true;
   followEnabled = true;
   document.getElementById('playToggle').textContent = '\u23F8';
+  preloadNextPhoto(playState.simTime);
   playState.lastFrameReal = performance.now();
   playState.rafId = requestAnimationFrame(playbackTick);
 }
@@ -1388,6 +1392,7 @@ function photoSimTime(photo) {
 async function loadPhotoPins(tripIds, preloaded) {
   photoMarkers.forEach((m) => playbackMap.removeLayer(m));
   photoMarkers = [];
+  photoEntries.forEach((e) => URL.revokeObjectURL(e.url)); // blobs re-read below; free the old URLs
   photoEntries = [];
   const all = preloaded || (await dbGetAllStore('photos'));
   const mine = all.filter((p) => tripIds.includes(p.tripId));
@@ -1416,8 +1421,12 @@ async function loadPhotoPins(tripIds, preloaded) {
 }
 
 /* ---- photo memory card: when playback reaches a photo's moment, glide to a stop and show it
- * big with its date/time, Google Photos memory style, then resume automatically ---- */
-const MEMORY_HOLD_MS = 2600;
+ * big with its date/time, Google Photos memory style, then resume automatically. Photos taken
+ * around the same moment share one hold and cycle as a stack instead of stop-starting playback
+ * once per photo. ---- */
+const MEMORY_HOLD_MS = 2600; // a single photo
+const MEMORY_GROUP_HOLD_MS = 1900; // per photo while cycling a stack
+const MEMORY_GROUP_SPAN_MS = 90000; // synth window binding photos into one held moment
 
 function nextUnshownPhotoBetween(fromSim, toSim) {
   let best = null;
@@ -1445,20 +1454,65 @@ function photoCaption(photo) {
   return caption;
 }
 
-function showPhotoMemory(entry) {
-  memoryActive = entry;
-  memoryShownIds.add(entry.photo.id);
-  document.getElementById('photoMemoryImg').src = entry.url;
+function collectMemoryGroup(entry) {
+  return photoEntries
+    .filter((e) => e.synth != null && !memoryShownIds.has(e.photo.id) && Math.abs(e.synth - entry.synth) <= MEMORY_GROUP_SPAN_MS)
+    .sort((a, b) => a.synth - b.synth);
+}
+
+function preloadNextPhoto(afterSynth) {
+  let next = null;
+  for (const e of photoEntries) {
+    if (e.synth != null && e.synth > afterSynth && (!next || e.synth < next.synth)) next = e;
+  }
+  if (next) new Image().src = next.url; // decode before its card fades in
+}
+
+function renderMemoryPhoto() {
+  const { group, index } = memoryActive;
+  const entry = group[index];
+  const img = document.getElementById('photoMemoryImg');
+  img.src = entry.url;
+  img.classList.remove('kenburns');
+  void img.offsetWidth; // restart the drift for each photo
+  img.classList.add('kenburns');
   document.getElementById('photoMemoryCaption').textContent = photoCaption(entry.photo);
+  const dots = document.getElementById('photoMemoryDots');
+  dots.innerHTML = group.length > 1 ? group.map((_, i) => `<span class="${i === index ? 'on' : ''}"></span>`).join('') : '';
+  preloadNextPhoto(entry.synth);
+}
+
+function showPhotoMemory(entry) {
+  const group = collectMemoryGroup(entry);
+  if (group.length === 0) return;
+  memoryActive = { group, index: 0 };
+  group.forEach((e) => memoryShownIds.add(e.photo.id));
+  renderMemoryPhoto();
   document.getElementById('photoMemory').classList.add('active');
   playState.holding = true;
+  scheduleMemoryStep();
+}
+
+function scheduleMemoryStep() {
+  const hold = memoryActive.group.length > 1 ? MEMORY_GROUP_HOLD_MS : MEMORY_HOLD_MS;
   memoryTimer = setTimeout(() => {
+    memoryTimer = null;
+    if (!memoryActive) return;
+    if (memoryActive.index < memoryActive.group.length - 1) {
+      memoryActive.index++;
+      const entry = memoryActive.group[memoryActive.index];
+      playState.simTime = Math.max(0, Math.min(entry.synth, playState.maxMs)); // marker hops along with the stack
+      playState.renderFn(playState.simTime);
+      renderMemoryPhoto();
+      scheduleMemoryStep();
+      return;
+    }
     dismissPhotoMemory();
     if (playState.playing) {
       playState.lastFrameReal = performance.now();
       playState.rafId = requestAnimationFrame(playbackTick);
     }
-  }, MEMORY_HOLD_MS);
+  }, hold);
 }
 
 function dismissPhotoMemory() {
@@ -1591,15 +1645,11 @@ function interpolateByRealTs(points, targetTs) {
   if (targetTs <= key(points[0])) return points[0];
   const last = points[points.length - 1];
   if (targetTs >= key(last)) return last;
-  for (let i = 0; i < points.length - 1; i++) {
-    const a = points[i], b = points[i + 1];
-    if (key(a) <= targetTs && key(b) >= targetTs) {
-      const span = key(b) - key(a) || 1;
-      const f = (targetTs - key(a)) / span;
-      return { lat: a.lat + (b.lat - a.lat) * f, lng: a.lng + (b.lng - a.lng) * f };
-    }
-  }
-  return last;
+  const i = lowerBoundIdx(points, targetTs, key);
+  const a = points[i], b = points[i + 1];
+  const span = key(b) - key(a) || 1;
+  const f = (targetTs - key(a)) / span;
+  return { lat: a.lat + (b.lat - a.lat) * f, lng: a.lng + (b.lng - a.lng) * f };
 }
 
 async function resolvePhotoAnchor(file) {
@@ -2009,6 +2059,8 @@ window.addEventListener('DOMContentLoaded', () => {
     dismissPhotoMemory();
     hideSummary();
     if (playbackMap) playbackMap.stop(); // kill any in-flight camera animation before the view goes away
+    photoEntries.forEach((e) => URL.revokeObjectURL(e.url));
+    photoEntries = [];
     currentHoliday = null;
     showView('home');
     renderHome();
@@ -2053,10 +2105,13 @@ window.addEventListener('DOMContentLoaded', () => {
   scrubEl.addEventListener('pointerup', () => { scrubbing = false; });
 
   document.getElementById('photoMemory').addEventListener('click', () => {
-    const entry = memoryActive;
+    const active = memoryActive;
     dismissPhotoMemory();
     pausePlayback();
-    if (entry) openPhotoLightbox(entry.photo, entry.url);
+    if (active) {
+      const entry = active.group[active.index];
+      openPhotoLightbox(entry.photo, entry.url);
+    }
   });
 
   document.querySelectorAll('.speed-btn[data-speed]').forEach((b) => {
