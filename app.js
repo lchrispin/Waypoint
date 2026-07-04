@@ -1,6 +1,6 @@
 /* ---------- IndexedDB ---------- */
 const DB_NAME = 'waypointDB';
-const DB_VERSION = 2;
+const DB_VERSION = 3;
 const STORE = 'trips';
 
 function dbOpen() {
@@ -11,6 +11,7 @@ function dbOpen() {
       if (!db.objectStoreNames.contains(STORE)) db.createObjectStore(STORE, { keyPath: 'id' });
       if (!db.objectStoreNames.contains('collections')) db.createObjectStore('collections', { keyPath: 'id' });
       if (!db.objectStoreNames.contains('photos')) db.createObjectStore('photos', { keyPath: 'id' });
+      if (!db.objectStoreNames.contains('places')) db.createObjectStore('places', { keyPath: 'id' });
     };
     req.onsuccess = () => resolve(req.result);
     req.onerror = () => reject(req.error);
@@ -31,6 +32,15 @@ async function dbGetAllStore(store) {
   return new Promise((resolve, reject) => {
     const tx = db.transaction(store, 'readonly');
     const req = tx.objectStore(store).getAll();
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+async function dbGetStore(store, key) {
+  const db = await dbOpen();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(store, 'readonly');
+    const req = tx.objectStore(store).get(key);
     req.onsuccess = () => resolve(req.result);
     req.onerror = () => reject(req.error);
   });
@@ -505,6 +515,70 @@ function eventAtSimTime(simTime) {
   return list.find((e) => simTime >= e.synthStart && simTime <= e.synthEnd) || null;
 }
 
+/* ---- place names: cached reverse geocoding so the story says "Stayed in Siena", not "here" ----
+ * Same etiquette as the OSRM road-snap: the free Nominatim endpoint at 1 req/s, results cached
+ * in IndexedDB so each place is fetched once ever, and everything degrades to the generic label
+ * when offline. Lookups resolve in the background; banners pick names up on their next frame. */
+const placeNames = new Map(); // key -> resolved name (or null for "looked up, nothing usable")
+const placePending = new Set();
+let placeQueue = Promise.resolve();
+
+function placeKey(lat, lng) {
+  return `${lat.toFixed(3)},${lng.toFixed(3)}`; // ~100 m grid: one lookup covers a whole stop
+}
+function placeNameSync(lat, lng) {
+  return placeNames.get(placeKey(lat, lng)) || null;
+}
+
+function requestPlaceName(lat, lng, onResolve) {
+  const key = placeKey(lat, lng);
+  if (placeNames.has(key)) {
+    if (onResolve) onResolve(placeNames.get(key));
+    return;
+  }
+  if (placePending.has(key)) return;
+  placePending.add(key);
+  placeQueue = placeQueue.then(async () => {
+    try {
+      const cached = await dbGetStore('places', key);
+      if (cached) {
+        placeNames.set(key, cached.name);
+      } else {
+        const res = await fetch(`https://nominatim.openstreetmap.org/reverse?format=jsonv2&lat=${lat}&lon=${lng}&zoom=12`);
+        if (res.ok) {
+          const data = await res.json();
+          const a = data.address || {};
+          const name = a.city || a.town || a.village || a.suburb || a.municipality || a.county || null;
+          placeNames.set(key, name);
+          await dbPutStore('places', { id: key, name, fetchedAt: Date.now() });
+        }
+        await new Promise((r) => setTimeout(r, 1100)); // the free endpoint allows 1 req/s
+      }
+    } catch (e) {
+      /* offline — labels stay generic and we'll retry on a future visit */
+    }
+    placePending.delete(key);
+    if (onResolve) onResolve(placeNames.get(key) ?? null);
+  });
+}
+
+function queuePlaceLookups() {
+  const refresh = () => {
+    if (playbackMode === 'overview') renderStorylineStrip();
+  };
+  const events = (currentHoliday ? currentHoliday.events : playState.events) || [];
+  for (const ev of events) {
+    requestPlaceName(ev.lat, ev.lng, refresh);
+    if (ev.kind === 'jump' && ev.latEnd != null) requestPlaceName(ev.latEnd, ev.lngEnd, refresh);
+  }
+  for (const c of playState.chapters || []) {
+    if (!c.latlngs || !c.latlngs.length) continue;
+    requestPlaceName(c.latlngs[0][0], c.latlngs[0][1], refresh);
+    const end = c.latlngs[c.latlngs.length - 1];
+    requestPlaceName(end[0], end[1], refresh);
+  }
+}
+
 function nightsBetween(a, b) {
   const d1 = new Date(a); d1.setHours(0, 0, 0, 0);
   const d2 = new Date(b); d2.setHours(0, 0, 0, 0);
@@ -518,13 +592,17 @@ function fmtSpanShort(ms) {
 }
 function stayLabel(ev) {
   if (ev.kind === 'jump') {
+    const dest = ev.latEnd != null ? placeNameSync(ev.latEnd, ev.lngEnd) : null;
+    if (dest) return `Traveling to ${dest} · +${fmtSpanShort(ev.realSpanMs)}`;
     const d = ev.latEnd != null ? haversine({ lat: ev.lat, lng: ev.lng }, { lat: ev.latEnd, lng: ev.lngEnd }) : 0;
     const dPart = d >= 1000 ? `${fmtDistance(d)} · ` : '';
     return `Traveling ${dPart}+${fmtSpanShort(ev.realSpanMs)}`;
   }
+  const place = placeNameSync(ev.lat, ev.lng);
+  const where = place ? `in ${place}` : 'here';
   const nights = nightsBetween(ev.realStart, ev.realEnd);
-  if (nights >= 1 && ev.realSpanMs >= 18 * 3600000) return `Stayed here · ${nights} night${nights === 1 ? '' : 's'}`;
-  return `Stayed here · ${fmtSpanShort(ev.realSpanMs)}`;
+  if (nights >= 1 && ev.realSpanMs >= 18 * 3600000) return `Stayed ${where} · ${nights} night${nights === 1 ? '' : 's'}`;
+  return `Stayed ${where} · ${fmtSpanShort(ev.realSpanMs)}`;
 }
 
 /* ---- adaptive playback pace: slow near photos/turns ----
@@ -934,8 +1012,10 @@ function renderStorylineStrip() {
     const card = document.createElement('div');
     card.className = 'chapter-card';
     card.dataset.idx = c.idx;
+    // holiday legs carry the user's own names; only generic Day/Stage titles earn a place suffix
+    const place = !currentHoliday && c.latlngs && c.latlngs.length ? placeNameSync(c.latlngs[0][0], c.latlngs[0][1]) : null;
     card.innerHTML = `
-      <div class="chapter-title">${escapeHtml(c.title)}</div>
+      <div class="chapter-title">${escapeHtml(c.title)}${place ? ` · ${escapeHtml(place)}` : ''}</div>
       <div class="chapter-meta">${escapeHtml(c.dateLabel)} · ${fmtDistance(c.distance)}</div>
       ${thumbs.length ? `<div class="chapter-thumbs">${thumbs.map((t) => `<div style="background-image:url('${t.url}')"></div>`).join('')}</div>` : ''}`;
     card.addEventListener('click', () => enterPlaying(c.synthStart, true));
@@ -1088,6 +1168,16 @@ function showSummary() {
   const bits = [`${days} day${days === 1 ? '' : 's'}`, fmtDistance(dist)];
   if (photoEntries.length) bits.push(`${photoEntries.length} photo${photoEntries.length === 1 ? '' : 's'}`);
   document.getElementById('summaryStats').textContent = bits.join(' · ');
+  let route = '';
+  if (chapters.length && chapters[0].latlngs && chapters[0].latlngs.length) {
+    const first = chapters[0].latlngs[0];
+    const lastC = chapters[chapters.length - 1];
+    const last = lastC.latlngs[lastC.latlngs.length - 1];
+    const a = placeNameSync(first[0], first[1]);
+    const b = placeNameSync(last[0], last[1]);
+    if (a && b) route = a === b ? a : `${a} → ${b}`;
+  }
+  document.getElementById('summaryRoute').textContent = route;
   document.getElementById('summaryOverviewBtn').style.display = overviewAvailable ? '' : 'none';
   document.getElementById('summaryOverlay').classList.add('active');
 }
@@ -1150,6 +1240,7 @@ async function openPlayback(id) {
   playState.chapters = buildChapters();
   assignStoryPacing(playState.chapters);
   buildScrubber();
+  queuePlaceLookups();
   overviewAvailable = playState.chapters.length > 1;
   if (overviewAvailable) enterOverview();
   else enterPlaying(0, false);
@@ -1265,6 +1356,7 @@ async function openHolidayPlayback(collectionId) {
   playState.chapters = buildChapters();
   assignStoryPacing(playState.chapters);
   buildScrubber();
+  queuePlaceLookups();
   overviewAvailable = true; // a holiday always has a story worth an overview
   enterOverview();
 }

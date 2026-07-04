@@ -588,6 +588,12 @@ html, body {
   margin: 0 auto;
 }
 .summary-glyph { font-size: 34px; color: var(--amber); margin-bottom: 8px; }
+.summary-route {
+  font-size: 14px;
+  color: var(--paper-dim);
+  margin-bottom: 6px;
+}
+.summary-route:empty { display: none; }
 .summary-stats {
   font-family: var(--font-data);
   font-size: 13px;
