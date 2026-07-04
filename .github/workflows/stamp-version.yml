@@ -1,0 +1,43 @@
+# Stamps index.html's asset version queries (app.js?v=..., style.css?v=...) with the commit SHA
+# on every push to main, so the page and its assets always deploy as a matched pair and a stale
+# HTTP-cached script can never run against fresh markup. GitHub Pages then redeploys from the
+# stamp commit. The [auto-stamp] marker stops the bot's own push from re-triggering the job.
+name: Stamp asset versions
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - app.js
+      - style.css
+      - index.html
+      - sw.js
+
+permissions:
+  contents: write
+
+jobs:
+  stamp:
+    if: ${{ !contains(github.event.head_commit.message, '[auto-stamp]') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Stamp version queries with commit SHA
+        run: |
+          SHA="${GITHUB_SHA::8}"
+          sed -i -E "s/(app\.js\?v=)[A-Za-z0-9]+/\1${SHA}/; s/(style\.css\?v=)[A-Za-z0-9]+/\1${SHA}/" index.html
+          grep -n "?v=${SHA}" index.html
+
+      - name: Commit and push if changed
+        run: |
+          if git diff --quiet; then
+            echo "Already stamped — nothing to do."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add index.html
+          git commit -m "Stamp assets to ${GITHUB_SHA::8} [auto-stamp]"
+          git push
