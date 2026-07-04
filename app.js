@@ -70,7 +70,11 @@ function bearing(a, b) {
   return ((Math.atan2(y, x) * 180) / Math.PI + 360) % 360;
 }
 function fmtDistance(m) {
-  return m >= 1000 ? (m / 1000).toFixed(2) + ' km' : Math.round(m) + ' m';
+  if (m < 1000) return Math.round(m) + ' m';
+  const km = m / 1000;
+  if (km >= 100) return Math.round(km) + ' km';
+  if (km >= 10) return km.toFixed(1) + ' km';
+  return km.toFixed(2) + ' km';
 }
 function fmtDuration(sec) {
   sec = Math.max(0, Math.round(sec));
@@ -372,10 +376,9 @@ let playbackBounds = null;
 let momentLayer = null;
 let chapterLines = [];
 let activeChapterIdx = -1;
-let uniformModeEnabled = false;
 let followEnabled = false;
 let autoZoomCurrent = null;
-let playState = { playing: false, speed: 20, rafId: null, simTime: 0, lastFrameReal: 0, maxMs: 0, renderFn: null };
+let playState = { playing: false, speed: 1, rafId: null, simTime: 0, lastFrameReal: 0, maxMs: 0, renderFn: null };
 
 function pointAtSimTime(points, simTime) {
   const t0 = points[0].ts;
@@ -511,7 +514,11 @@ function fmtSpanShort(ms) {
   return Math.max(1, Math.round(ms / 60000)) + ' min';
 }
 function stayLabel(ev) {
-  if (ev.kind === 'jump') return `Traveling · +${fmtSpanShort(ev.realSpanMs)}`;
+  if (ev.kind === 'jump') {
+    const d = ev.latEnd != null ? haversine({ lat: ev.lat, lng: ev.lng }, { lat: ev.latEnd, lng: ev.lngEnd }) : 0;
+    const dPart = d >= 1000 ? `${fmtDistance(d)} · ` : '';
+    return `Traveling ${dPart}+${fmtSpanShort(ev.realSpanMs)}`;
+  }
   const nights = nightsBetween(ev.realStart, ev.realEnd);
   if (nights >= 1 && ev.realSpanMs >= 18 * 3600000) return `Stayed here · ${nights} night${nights === 1 ? '' : 's'}`;
   return `Stayed here · ${fmtSpanShort(ev.realSpanMs)}`;
@@ -596,23 +603,41 @@ function currentPaceMultiplier(simTime) {
   return paceMultiplierAt(playState.paceProfile, simTime);
 }
 
-/* ---- uniform stage duration: normalize a leg's (or a whole single trip's) real length to one target wall-clock duration ----
- * Capped well below the general speed range: a very long leg (e.g. a multi-hour flight) would
- * otherwise need a huge multiplier to fit the target duration, moving faster than map tiles can
- * load. Past the cap it just takes a bit longer than the target instead of breaking the map. */
-const UNIFORM_TARGET_MS = 35000;
-const UNIFORM_MAX_SPEED = 150;
-function clampUniformSpeed(v) {
-  return Math.min(UNIFORM_MAX_SPEED, Math.max(1, v));
+/* ---- story pacing: the viewer's time is the fixed budget, the trip flexes to fit it ----
+ * Each chapter gets a display duration on a log curve of its distance, so a 1 km stroll takes
+ * ~12 s and a 1,000 km drive ~35 s rather than 1000x. If the whole story would still run long,
+ * everything scales down proportionally. Speed is capped so tiles can keep up (a very long leg
+ * just runs a bit over its target instead of outrunning the map), and the user's speed buttons
+ * are relative nudges (0.5x / 1x / 2x story time) on top. */
+const STORY_MAX_SPEED = 150;
+const STORY_GAP_SPEED = 20; // through compressed stays/jumps and inter-leg gaps (~2-2.5 s each)
+const STORY_TOTAL_BUDGET_S = 150;
+
+function storySecondsForDistance(m) {
+  const km = m / 1000;
+  return Math.min(35, Math.max(10, 8 + 6 * Math.log(1 + km)));
 }
-function currentBaseSpeed(simTime) {
-  if (!uniformModeEnabled) return playState.speed;
-  if (currentHoliday) {
-    const leg = legAtSimTime(simTime);
-    if (leg) return clampUniformSpeed((leg.synthEnd - leg.synthStart) / UNIFORM_TARGET_MS);
-    return playState.speed; // in the gap between legs — no single stage to normalize to
+
+function assignStoryPacing(chapters) {
+  let total = 0;
+  for (const c of chapters) {
+    c.storySec = storySecondsForDistance(c.distance);
+    total += c.storySec;
   }
-  return clampUniformSpeed(playState.maxMs / UNIFORM_TARGET_MS);
+  if (total > STORY_TOTAL_BUDGET_S) {
+    const f = STORY_TOTAL_BUDGET_S / total;
+    for (const c of chapters) c.storySec *= f;
+  }
+  for (const c of chapters) {
+    const span = c.synthEnd - c.synthStart;
+    c.storySpeed = Math.min(STORY_MAX_SPEED, Math.max(1, span / (c.storySec * 1000)));
+  }
+}
+
+function currentBaseSpeed(simTime) {
+  const mult = playState.speed || 1;
+  const c = chapterAtSimTime(simTime);
+  return (c ? c.storySpeed : STORY_GAP_SPEED) * mult;
 }
 
 function setupPlaybackMap(legsForGhost) {
@@ -639,6 +664,7 @@ function setupPlaybackMap(legsForGhost) {
   playbackBounds = allBounds;
   photoMarkers = [];
   stayPulseMarker = null;
+  travelArc = null;
   momentLayer = null;
   chapterLines = [];
   activeChapterIdx = -1;
@@ -659,6 +685,69 @@ function updateStayPulse(ev) {
   } else {
     stayPulseMarker.setLatLng([ev.lat, ev.lng]);
   }
+}
+
+/* ---- travel arcs: the "Indiana Jones map" cut for big unrecorded jumps ----
+ * When playback crosses a gap whose displacement is flight/long-drive sized, the camera pulls
+ * out to frame both endpoints and a dashed arc sweeps across, instead of the dot teleporting. */
+const ARC_MIN_DIST_M = 50000;
+let travelArc = null;
+
+function travelGapAt(simTime) {
+  if (currentHoliday && !legAtSimTime(simTime)) {
+    const prev = [...currentHoliday.legs].reverse().find((l) => l.synthEnd <= simTime);
+    const next = currentHoliday.legs.find((l) => l.synthStart > simTime);
+    if (!prev || !next) return null;
+    const from = prev.points[prev.points.length - 1];
+    const to = next.points[0];
+    return { key: 'gap' + prev.synthEnd, start: prev.synthEnd, end: next.synthStart, from, to };
+  }
+  const ev = eventAtSimTime(simTime);
+  if (ev && ev.kind === 'jump' && ev.latEnd != null) {
+    return { key: 'ev' + ev.synthStart, start: ev.synthStart, end: ev.synthEnd, from: { lat: ev.lat, lng: ev.lng }, to: { lat: ev.latEnd, lng: ev.lngEnd } };
+  }
+  return null;
+}
+
+function arcLatLngs(from, to, f) {
+  const ctrl = {
+    lat: (from.lat + to.lat) / 2 - (to.lng - from.lng) * 0.18,
+    lng: (from.lng + to.lng) / 2 + (to.lat - from.lat) * 0.18,
+  };
+  const steps = 48;
+  const upto = Math.max(1, Math.round(f * steps));
+  const out = [];
+  for (let i = 0; i <= upto; i++) {
+    const t = i / steps;
+    const a = (1 - t) * (1 - t), b = 2 * (1 - t) * t, c = t * t;
+    out.push([a * from.lat + b * ctrl.lat + c * to.lat, a * from.lng + b * ctrl.lng + c * to.lng]);
+  }
+  return out;
+}
+
+/* Returns the arc tip position while a big jump is on screen, else null. */
+function updateTravelArc(simTime) {
+  const gap = travelGapAt(simTime);
+  const big = gap && haversine(gap.from, gap.to) >= ARC_MIN_DIST_M ? gap : null;
+  if (!big) {
+    if (travelArc) {
+      playbackMap.removeLayer(travelArc.line);
+      travelArc = null;
+      autoZoomCurrent = null; // reseed the follow camera after the wide shot
+      if (playState.playing) followEnabled = true;
+    }
+    return null;
+  }
+  if (!travelArc || travelArc.key !== big.key) {
+    if (travelArc) playbackMap.removeLayer(travelArc.line);
+    travelArc = { key: big.key, line: L.polyline([], { color: '#E8934A', weight: 3, dashArray: '6,9', opacity: 0.9 }).addTo(playbackMap) };
+    followEnabled = false;
+    playbackMap.flyToBounds(L.latLngBounds([big.from.lat, big.from.lng], [big.to.lat, big.to.lng]).pad(0.35), { duration: 0.9 });
+  }
+  const f = Math.max(0, Math.min(1, (simTime - big.start) / Math.max(1, big.end - big.start)));
+  const pts = arcLatLngs(big.from, big.to, f);
+  travelArc.line.setLatLngs(pts);
+  return pts[pts.length - 1];
 }
 
 /* ---- chapters: the storyline units a viewer scans and jumps between ----
@@ -913,6 +1002,76 @@ function enterPlaying(simTime, autoplay) {
   else document.getElementById('playToggle').textContent = '▶';
 }
 
+/* ---- segmented story scrubber: one segment per chapter sized by its display time, with photo
+ * dots and stay ticks, so the structure of the story is visible before pressing play ---- */
+let scrubSegs = [];
+
+function buildScrubber() {
+  const el = document.getElementById('storyScrubber');
+  el.innerHTML = '';
+  scrubSegs = [];
+  const chapters = playState.chapters || [];
+  const spans = [];
+  let cursor = 0;
+  for (const c of chapters) {
+    if (c.synthStart > cursor + 1) spans.push({ start: cursor, end: c.synthStart, gap: true });
+    spans.push({ start: c.synthStart, end: c.synthEnd, gap: false, weight: c.storySec || 1 });
+    cursor = c.synthEnd;
+  }
+  if (cursor < playState.maxMs - 1) spans.push({ start: cursor, end: playState.maxMs, gap: true });
+
+  const events = (currentHoliday ? currentHoliday.events : playState.events) || [];
+  for (const sp of spans) {
+    const seg = document.createElement('div');
+    seg.className = 'scrub-seg' + (sp.gap ? ' gap' : '');
+    if (!sp.gap) seg.style.flexGrow = String(sp.weight);
+    const fill = document.createElement('div');
+    fill.className = 'scrub-fill';
+    seg.appendChild(fill);
+    if (!sp.gap) {
+      const at = (t) => (((t - sp.start) / (sp.end - sp.start)) * 100) + '%';
+      for (const e of photoEntries) {
+        if (e.synth != null && e.synth >= sp.start && e.synth <= sp.end) {
+          const dot = document.createElement('span');
+          dot.className = 'scrub-dot';
+          dot.style.left = at(e.synth);
+          seg.appendChild(dot);
+        }
+      }
+      for (const ev of events) {
+        if (ev.synthStart > sp.start && ev.synthEnd < sp.end) {
+          const tick = document.createElement('span');
+          tick.className = 'scrub-tick';
+          tick.style.left = at((ev.synthStart + ev.synthEnd) / 2);
+          seg.appendChild(tick);
+        }
+      }
+    }
+    el.appendChild(seg);
+    scrubSegs.push({ el: seg, fill, start: sp.start, end: sp.end });
+  }
+}
+
+function updateScrubberValue(sim) {
+  for (const s of scrubSegs) {
+    const f = s.end > s.start ? Math.max(0, Math.min(1, (sim - s.start) / (s.end - s.start))) : sim >= s.end ? 1 : 0;
+    s.fill.style.width = f * 100 + '%';
+  }
+}
+
+function simFromScrubberX(clientX) {
+  for (let i = 0; i < scrubSegs.length; i++) {
+    const s = scrubSegs[i];
+    const r = s.el.getBoundingClientRect();
+    if (clientX <= r.right || i === scrubSegs.length - 1) {
+      if (clientX < r.left) return s.start;
+      const f = Math.max(0, Math.min(1, (clientX - r.left) / Math.max(1, r.width)));
+      return s.start + f * (s.end - s.start);
+    }
+  }
+  return playState.maxMs;
+}
+
 /* ---- end-of-story summary ---- */
 function showSummary() {
   const chapters = playState.chapters || [];
@@ -946,7 +1105,7 @@ function computeTargetZoom(pos, aheadPos) {
   const metersPerPixel = spanMeters / (minDim * 0.22);
   const latRad = (pos.lat * Math.PI) / 180;
   const zoom = Math.log2((156543.03392 * Math.cos(latRad)) / metersPerPixel);
-  return Math.min(14, Math.max(5, zoom));
+  return Math.min(17, Math.max(4, zoom));
 }
 
 function updateAutoFollow(pos, aheadPos) {
@@ -982,13 +1141,12 @@ async function openPlayback(id) {
   const paceProfile = buildPaceProfile(timeline.points, tripPhotos, 0);
 
   const maxMs = timeline.maxMs;
-  playState = { playing: false, speed: 20, rafId: null, simTime: 0, lastFrameReal: 0, maxMs, renderFn: renderFrame, paceProfile, displayPoints: timeline.points, events: timeline.events };
-  setSpeedButtons(20);
-  setUniformMode(uniformModeEnabled);
-  document.getElementById('scrubber').max = maxMs;
-  document.getElementById('scrubber').value = 0;
+  playState = { playing: false, speed: 1, rafId: null, simTime: 0, lastFrameReal: 0, maxMs, renderFn: renderFrame, paceProfile, displayPoints: timeline.points, events: timeline.events };
+  setSpeedButtons(1);
   await loadPhotoPins([currentPlayTrip.id], allPhotos);
   playState.chapters = buildChapters();
+  assignStoryPacing(playState.chapters);
+  buildScrubber();
   overviewAvailable = playState.chapters.length > 1;
   if (overviewAvailable) enterOverview();
   else enterPlaying(0, false);
@@ -1015,9 +1173,11 @@ function renderFrame(simTime) {
   } else {
     banner.classList.remove('active');
   }
-  updateStayPulse(ev);
+  const arcTip = updateTravelArc(simTime);
+  if (arcTip) playMarker.setLatLng(arcTip);
+  updateStayPulse(travelArc ? null : ev);
 
-  document.getElementById('scrubber').value = simTime;
+  updateScrubberValue(simTime);
   document.getElementById('readoutClock').textContent = fmtClock(pos.realTs ?? pos.ts);
   document.getElementById('readoutDist').textContent = fmtDistance(dist);
   document.getElementById('readoutSpeed').textContent = ev ? '\u2014' : fmtSpeed(computeSpeedKmh(pts, pos.realTs ?? pos.ts));
@@ -1096,13 +1256,12 @@ async function openHolidayPlayback(collectionId) {
   showView('playback');
   setupPlaybackMap(legs);
 
-  playState = { playing: false, speed: 20, rafId: null, simTime: 0, lastFrameReal: 0, maxMs, renderFn: renderHolidayFrame };
-  setSpeedButtons(20);
-  setUniformMode(uniformModeEnabled);
-  document.getElementById('scrubber').max = maxMs;
-  document.getElementById('scrubber').value = 0;
+  playState = { playing: false, speed: 1, rafId: null, simTime: 0, lastFrameReal: 0, maxMs, renderFn: renderHolidayFrame };
+  setSpeedButtons(1);
   await loadPhotoPins(tripList.map((t) => t.id), allPhotos);
   playState.chapters = buildChapters();
+  assignStoryPacing(playState.chapters);
+  buildScrubber();
   overviewAvailable = true; // a holiday always has a story worth an overview
   enterOverview();
 }
@@ -1132,8 +1291,10 @@ function renderHolidayFrame(simTime) {
     banner.textContent = nextLeg ? `Traveling to ${nextLeg.name}\u2026` : 'Holiday complete';
   }
   banner.classList.add('active');
-  updateStayPulse(ev);
   playMarker.setLatLng([pos.lat, pos.lng]);
+  const arcTip = updateTravelArc(simTime);
+  if (arcTip) playMarker.setLatLng(arcTip);
+  updateStayPulse(travelArc ? null : ev);
 
   let completedDist = 0;
   for (const l of currentHoliday.legs) {
@@ -1141,7 +1302,7 @@ function renderHolidayFrame(simTime) {
   }
   const totalDist = completedDist + partialDist;
 
-  document.getElementById('scrubber').value = simTime;
+  updateScrubberValue(simTime);
   document.getElementById('readoutClock').textContent = fmtClock(pos.realTs ?? pos.ts);
   document.getElementById('readoutDist').textContent = fmtDistance(totalDist);
   document.getElementById('readoutSpeed').textContent = ev || !leg ? '\u2014' : fmtSpeed(computeSpeedKmh(leg.points, pos.realTs ?? pos.ts));
@@ -1196,13 +1357,6 @@ function pausePlayback() {
 function setSpeedButtons(speed) {
   playState.speed = speed;
   document.querySelectorAll('.speed-btn[data-speed]').forEach((b) => b.classList.toggle('active', Number(b.dataset.speed) === speed));
-}
-
-function setUniformMode(on) {
-  uniformModeEnabled = on;
-  document.getElementById('uniformSpeedBtn').classList.toggle('active', on);
-  if (on) document.querySelectorAll('.speed-btn[data-speed]').forEach((b) => b.classList.remove('active'));
-  else setSpeedButtons(playState.speed);
 }
 
 function updatePaceBadge(simTime) {
@@ -1880,14 +2034,23 @@ window.addEventListener('DOMContentLoaded', () => {
     else { playState.lastFrameReal = performance.now(); startPlayback(); }
   });
 
-  document.getElementById('scrubber').addEventListener('input', (e) => {
+  const scrubEl = document.getElementById('storyScrubber');
+  let scrubbing = false;
+  const doScrub = (e) => {
     pausePlayback();
     dismissPhotoMemory();
     followEnabled = true;
-    playState.simTime = Number(e.target.value);
+    playState.simTime = Math.max(0, Math.min(simFromScrubberX(e.clientX), playState.maxMs));
     rearmMemoriesAfter(playState.simTime);
     playState.renderFn(playState.simTime);
+  };
+  scrubEl.addEventListener('pointerdown', (e) => {
+    scrubbing = true;
+    scrubEl.setPointerCapture(e.pointerId);
+    doScrub(e);
   });
+  scrubEl.addEventListener('pointermove', (e) => { if (scrubbing) doScrub(e); });
+  scrubEl.addEventListener('pointerup', () => { scrubbing = false; });
 
   document.getElementById('photoMemory').addEventListener('click', () => {
     const entry = memoryActive;
@@ -1897,9 +2060,8 @@ window.addEventListener('DOMContentLoaded', () => {
   });
 
   document.querySelectorAll('.speed-btn[data-speed]').forEach((b) => {
-    b.addEventListener('click', () => { setSpeedButtons(Number(b.dataset.speed)); setUniformMode(false); });
+    b.addEventListener('click', () => setSpeedButtons(Number(b.dataset.speed)));
   });
-  document.getElementById('uniformSpeedBtn').addEventListener('click', () => setUniformMode(!uniformModeEnabled));
 
   document.getElementById('deleteTripBtn').addEventListener('click', async () => {
     if (currentHoliday) {

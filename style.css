@@ -190,10 +190,56 @@ html, body {
 .pace-badge.slow { color: var(--amber); }
 .pace-badge.fast { color: var(--teal); }
 
-.scrubber {
-  width: 100%;
-  accent-color: var(--amber);
-  margin-bottom: 12px;
+.story-scrubber {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  height: 24px;
+  margin-bottom: 10px;
+  cursor: pointer;
+  touch-action: none;
+}
+.scrub-seg {
+  position: relative;
+  flex-grow: 1;
+  flex-basis: 0;
+  height: 6px;
+  border-radius: 4px;
+  background: var(--navy-2);
+  border: 1px solid var(--line);
+}
+.scrub-seg.gap {
+  flex: 0 0 10px;
+  height: 2px;
+  background: none;
+  border: none;
+  border-top: 2px dotted var(--teal);
+  border-radius: 0;
+}
+.scrub-fill {
+  position: absolute;
+  left: 0; top: 0; bottom: 0;
+  width: 0;
+  background: var(--amber);
+  border-radius: 4px;
+}
+.scrub-seg.gap .scrub-fill { background: none; }
+.scrub-dot {
+  position: absolute;
+  top: -5px;
+  width: 7px; height: 7px;
+  margin-left: -3.5px;
+  border-radius: 50%;
+  background: var(--paper);
+  border: 1.5px solid var(--amber);
+}
+.scrub-tick {
+  position: absolute;
+  top: -4px;
+  width: 2px; height: 12px;
+  margin-left: -1px;
+  background: var(--teal);
+  border-radius: 1px;
 }
 
 .playback-buttons { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
@@ -226,9 +272,6 @@ html, body {
   cursor: pointer;
 }
 .speed-btn.active { border-color: var(--amber); color: var(--amber); }
-
-.uniform-btn { flex-shrink: 0; }
-.uniform-btn.active { border-color: var(--teal); color: var(--teal); }
 
 /* ---------- Naming modal ---------- */
 .modal-backdrop {
