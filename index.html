@@ -13,7 +13,8 @@
 <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&family=Space+Mono&display=swap" rel="stylesheet" />
 
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css" />
-<link rel="stylesheet" href="style.css" />
+<!-- version query = cache buster: bump together with app.js's so HTML and assets update atomically -->
+<link rel="stylesheet" href="style.css?v=20260704a" />
 </head>
 <body>
 <div id="app">
@@ -234,6 +235,6 @@
 </div>
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
-<script src="app.js"></script>
+<script src="app.js?v=20260704a"></script>
 </body>
 </html>
