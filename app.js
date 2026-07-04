@@ -1698,11 +1698,14 @@ function parseTiff(view, tiffStart) {
   }
 
   const ifd0 = readIfd(tiffStart + u32(tiffStart + 4));
-  let dateTimeOriginal = null;
+  let dateTimeOriginal = null, tzOffset = null;
   if (ifd0[0x0132]) dateTimeOriginal = readValue(ifd0[0x0132]);
   if (ifd0[0x8769]) {
     const subIfd = readIfd(tiffStart + readValue(ifd0[0x8769]));
     if (subIfd[0x9003]) dateTimeOriginal = readValue(subIfd[0x9003]);
+    // OffsetTimeOriginal (fallback OffsetTime): the capture-local UTC offset, e.g. "+02:00"
+    const offsetEntry = subIfd[0x9011] || subIfd[0x9010];
+    if (offsetEntry) tzOffset = readValue(offsetEntry);
   }
 
   let lat = null, lng = null, gpsTs = null;
@@ -1711,22 +1714,43 @@ function parseTiff(view, tiffStart) {
     if (gps[1] && gps[2] && gps[3] && gps[4]) {
       const latRef = readValue(gps[1]), latDms = readValue(gps[2]);
       const lngRef = readValue(gps[3]), lngDms = readValue(gps[4]);
-      lat = (latDms[0] + latDms[1] / 60 + latDms[2] / 3600) * (latRef === 'S' ? -1 : 1);
-      lng = (lngDms[0] + lngDms[1] / 60 + lngDms[2] / 3600) * (lngRef === 'W' ? -1 : 1);
+      // cameras with no fix (location permission off) still write a GPS block, just zeroed out:
+      // blank refs and 0/0 rationals. Parsing that as 0°N 0°E would "place" the photo in the
+      // Atlantic and poison trip matching, so only trust coordinates that look like a real fix.
+      const looksReal =
+        (latRef === 'N' || latRef === 'S') &&
+        (lngRef === 'E' || lngRef === 'W') &&
+        Array.isArray(latDms) && Array.isArray(lngDms) &&
+        (latDms.some((v) => v !== 0) || lngDms.some((v) => v !== 0));
+      if (looksReal) {
+        lat = (latDms[0] + latDms[1] / 60 + latDms[2] / 3600) * (latRef === 'S' ? -1 : 1);
+        lng = (lngDms[0] + lngDms[1] / 60 + lngDms[2] / 3600) * (lngRef === 'W' ? -1 : 1);
+      }
     }
     if (gps[29] && gps[7]) {
       const dateStr = readValue(gps[29]);
       const time = readValue(gps[7]);
-      const [y, mo, d] = dateStr.split(':').map(Number);
+      const [y, mo, d] = String(dateStr).split(':').map(Number);
       gpsTs = Date.UTC(y, mo - 1, d, time[0], time[1], Math.floor(time[2]));
+      if (isNaN(gpsTs)) gpsTs = null; // a zeroed GPS block must not shadow DateTimeOriginal below
     }
   }
 
   let ts = gpsTs;
   if (ts == null && dateTimeOriginal) {
     const m = dateTimeOriginal.match(/(\d{4}):(\d{2}):(\d{2}) (\d{2}):(\d{2}):(\d{2})/);
-    if (m) ts = new Date(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +m[6]).getTime();
+    if (m) {
+      const tz = typeof tzOffset === 'string' ? tzOffset.match(/^([+-])(\d{2}):(\d{2})/) : null;
+      if (tz) {
+        // DateTimeOriginal is capture-local wall clock; the offset tag makes it absolute
+        const offsetMs = (tz[1] === '-' ? -1 : 1) * (+tz[2] * 60 + +tz[3]) * 60000;
+        ts = Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +m[6]) - offsetMs;
+      } else {
+        ts = new Date(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +m[6]).getTime(); // no offset tag — assume this device's zone
+      }
+    }
   }
+  if (ts != null && isNaN(ts)) ts = null;
 
   if (lat == null && ts == null) return null;
   return { lat, lng, ts };
