@@ -77,23 +77,32 @@
       <div id="photoMemoryCaption" class="photo-memory-caption"></div>
     </div>
     <div class="playback-panel">
-      <div class="readout">
-        <span id="readoutClock">--:--</span>
-        <span id="readoutDist">0 m</span>
-        <span id="readoutSpeed">—</span>
-        <span id="paceBadge" class="pace-badge"></span>
-      </div>
-      <input type="range" id="scrubber" class="scrubber" min="0" max="100" value="0" />
-      <div class="playback-buttons">
-        <button id="playToggle" class="play-toggle">&#9654;</button>
-        <div class="speed-select">
-          <button class="speed-btn" data-speed="5">5x</button>
-          <button class="speed-btn active" data-speed="20">20x</button>
-          <button class="speed-btn" data-speed="60">60x</button>
-          <button class="speed-btn" data-speed="200">200x</button>
+      <div id="playerPanel">
+        <div class="readout">
+          <span id="readoutClock">--:--</span>
+          <span id="readoutDist">0 m</span>
+          <span id="readoutSpeed">—</span>
+          <span id="paceBadge" class="pace-badge"></span>
         </div>
-        <button id="uniformSpeedBtn" class="icon-btn uniform-btn" title="Play every stage in about the same amount of time">Uniform</button>
-        <button id="addPhotoBtn" class="icon-btn photo-btn">+ Photo</button>
+        <input type="range" id="scrubber" class="scrubber" min="0" max="100" value="0" />
+        <div class="playback-buttons">
+          <button id="playToggle" class="play-toggle">&#9654;</button>
+          <div class="speed-select">
+            <button class="speed-btn" data-speed="5">5x</button>
+            <button class="speed-btn active" data-speed="20">20x</button>
+            <button class="speed-btn" data-speed="60">60x</button>
+            <button class="speed-btn" data-speed="200">200x</button>
+          </div>
+          <button id="uniformSpeedBtn" class="icon-btn uniform-btn" title="Play every stage in about the same amount of time">Uniform</button>
+          <button id="addPhotoBtn" class="icon-btn photo-btn">+ Photo</button>
+        </div>
+      </div>
+      <div id="overviewPanel" style="display:none">
+        <div class="overview-header">
+          <button id="overviewPlayBtn" class="play-toggle">&#9654;</button>
+          <div id="overviewStats" class="overview-stats"></div>
+        </div>
+        <div id="storylineStrip" class="storyline-strip"></div>
       </div>
     </div>
     <input type="file" id="photoFileInput" accept="image/*" multiple style="display:none" />
@@ -183,6 +192,31 @@
     <div class="modal-row">
       <button id="cancelRename" class="btn-ghost">Cancel</button>
       <button id="confirmRename" class="btn-primary">Save</button>
+    </div>
+  </div>
+</div>
+
+<!-- ===== photo moment sheet ===== -->
+<div id="momentSheet" class="modal-backdrop">
+  <div class="modal-sheet">
+    <h2 id="momentSheetTitle">Moment</h2>
+    <div id="momentGrid" class="moment-grid"></div>
+    <div class="modal-row">
+      <button id="momentCloseBtn" class="btn-ghost">Close</button>
+      <button id="momentPlayBtn" class="btn-primary">Play from here</button>
+    </div>
+  </div>
+</div>
+
+<!-- ===== end-of-story summary ===== -->
+<div id="summaryOverlay" class="modal-backdrop summary-overlay">
+  <div class="modal-sheet summary-sheet">
+    <div class="summary-glyph">&#9737;</div>
+    <h2 id="summaryTitle">Trip</h2>
+    <div id="summaryStats" class="summary-stats"></div>
+    <div class="modal-row">
+      <button id="summaryReplayBtn" class="btn-ghost">Replay</button>
+      <button id="summaryOverviewBtn" class="btn-primary">Overview</button>
     </div>
   </div>
 </div>

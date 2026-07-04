@@ -366,6 +366,12 @@ let stayPulseMarker = null;
 let memoryShownIds = new Set();
 let memoryActive = null;
 let memoryTimer = null;
+let playbackMode = 'playing'; // 'overview' (atlas: whole path + storyline strip) | 'playing' (ride-along)
+let overviewAvailable = false;
+let playbackBounds = null;
+let momentLayer = null;
+let chapterLines = [];
+let activeChapterIdx = -1;
 let uniformModeEnabled = false;
 let followEnabled = false;
 let autoZoomCurrent = null;
@@ -457,6 +463,8 @@ function buildTripTimeline(points) {
   }
   const events = spans.map((sp) => ({
     kind: sp.kind,
+    startIdx: sp.startIdx,
+    endIdx: sp.endIdx,
     synthStart: out[sp.startIdx].ts,
     synthEnd: out[sp.endIdx].ts,
     realStart: points[sp.startIdx].ts,
@@ -464,6 +472,8 @@ function buildTripTimeline(points) {
     realSpanMs: points[sp.endIdx].ts - points[sp.startIdx].ts,
     lat: points[sp.startIdx].lat,
     lng: points[sp.startIdx].lng,
+    latEnd: points[sp.endIdx].lat,
+    lngEnd: points[sp.endIdx].lng,
   }));
   return { points: out, events, maxMs: out[out.length - 1].ts };
 }
@@ -606,7 +616,7 @@ function currentBaseSpeed(simTime) {
 }
 
 function setupPlaybackMap(legsForGhost) {
-  if (playbackMap) { playbackMap.remove(); playbackMap = null; }
+  if (playbackMap) { playbackMap.stop(); playbackMap.remove(); playbackMap = null; }
   playbackMap = L.map('playbackMap', { zoomControl: false }).setView([20, 0], 3);
   playbackMap.getContainer().classList.add('map-dark');
   L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
@@ -626,8 +636,12 @@ function setupPlaybackMap(legsForGhost) {
   const firstPt = legsForGhost[0].points[0];
   playMarker = L.circleMarker([firstPt.lat, firstPt.lng], { radius: 7, color: '#F0EAD8', fillColor: '#E8934A', fillOpacity: 1, weight: 2 }).addTo(playbackMap);
   if (allBounds) playbackMap.fitBounds(allBounds, { padding: [30, 30] });
+  playbackBounds = allBounds;
   photoMarkers = [];
   stayPulseMarker = null;
+  momentLayer = null;
+  chapterLines = [];
+  activeChapterIdx = -1;
   followEnabled = false;
   autoZoomCurrent = null;
 }
@@ -645,6 +659,278 @@ function updateStayPulse(ev) {
   } else {
     stayPulseMarker.setLatLng([ev.lat, ev.lng]);
   }
+}
+
+/* ---- chapters: the storyline units a viewer scans and jumps between ----
+ * A holiday chapters by leg; a merged/single trip chapters by the movement segments between
+ * its stay/jump events. Chapters drive the overview strip, seeking, and (via storySec) pacing. */
+function buildChapters() {
+  const chapters = [];
+  if (currentHoliday) {
+    currentHoliday.legs.forEach((leg, i) => {
+      chapters.push({
+        idx: i,
+        title: leg.name,
+        dateLabel: fmtDate(leg.realStart),
+        synthStart: leg.synthStart,
+        synthEnd: leg.synthEnd,
+        realStart: leg.points[0].realTs,
+        realEnd: leg.points[leg.points.length - 1].realTs,
+        distance: leg.distance,
+        latlngs: leg.points.map((p) => [p.lat, p.lng]),
+      });
+    });
+    return chapters;
+  }
+
+  const pts = playState.displayPoints;
+  const segs = [];
+  let segStart = 0;
+  for (const ev of playState.events) {
+    if (ev.startIdx > segStart) segs.push([segStart, ev.startIdx]);
+    segStart = ev.endIdx;
+  }
+  if (segStart < pts.length - 1) segs.push([segStart, pts.length - 1]);
+
+  for (const [a, b] of segs) {
+    const slice = pts.slice(a, b + 1);
+    const d = pathDistance(slice);
+    const last = chapters[chapters.length - 1];
+    if (d < 50 && last) {
+      // GPS jitter around a stop, not a real movement segment — absorb into the previous chapter
+      last.synthEnd = pts[b].ts;
+      last.realEnd = pts[b].realTs;
+      last.distance += d;
+      continue;
+    }
+    chapters.push({
+      synthStart: pts[a].ts,
+      synthEnd: pts[b].ts,
+      realStart: pts[a].realTs,
+      realEnd: pts[b].realTs,
+      distance: d,
+      latlngs: slice.map((p) => [p.lat, p.lng]),
+    });
+  }
+
+  const multiDay = nightsBetween(pts[0].realTs, pts[pts.length - 1].realTs) >= 1;
+  const dayCounts = {};
+  for (const c of chapters) {
+    const day = nightsBetween(pts[0].realTs, c.realStart) + 1;
+    dayCounts[day] = (dayCounts[day] || 0) + 1;
+  }
+  chapters.forEach((c, i) => {
+    c.idx = i;
+    const day = nightsBetween(pts[0].realTs, c.realStart) + 1;
+    c.title = multiDay ? `Day ${day}` : `Stage ${i + 1}`;
+    // several chapters on one day would be indistinguishable — show the start time instead of the date
+    c.dateLabel = multiDay && dayCounts[day] === 1 ? fmtDate(c.realStart) : fmtClock(c.realStart);
+  });
+  return chapters;
+}
+
+function chapterAtSimTime(simTime) {
+  if (!playState.chapters) return null;
+  return playState.chapters.find((c) => simTime >= c.synthStart && simTime <= c.synthEnd) || null;
+}
+
+function photosForChapter(c) {
+  return photoEntries.filter((e) => e.synth != null && e.synth >= c.synthStart && e.synth <= c.synthEnd);
+}
+
+/* ---- photo moments: photos clustered in space and time, shown as one pin at atlas altitude ----
+ * The cluster radius derives from the trip's bounding box so a walking tour clusters per café
+ * and a road trip clusters per town. */
+function clusterPhotoMoments(entries) {
+  let radius = 60;
+  if (playbackBounds) {
+    const nw = playbackBounds.getNorthWest(), se = playbackBounds.getSouthEast();
+    radius = Math.max(60, haversine({ lat: nw.lat, lng: nw.lng }, { lat: se.lat, lng: se.lng }) / 50);
+  }
+  const clusters = [];
+  const sorted = entries.filter((e) => e.synth != null).slice().sort((a, b) => a.photo.ts - b.photo.ts);
+  for (const e of sorted) {
+    const c = clusters.find(
+      (cl) => e.photo.ts - cl.lastTs <= 6 * 3600000 && haversine(cl.center, { lat: e.photo.lat, lng: e.photo.lng }) <= radius
+    );
+    if (c) {
+      c.entries.push(e);
+      c.lastTs = e.photo.ts;
+      c.center = {
+        lat: c.entries.reduce((s, x) => s + x.photo.lat, 0) / c.entries.length,
+        lng: c.entries.reduce((s, x) => s + x.photo.lng, 0) / c.entries.length,
+      };
+    } else {
+      clusters.push({ entries: [e], center: { lat: e.photo.lat, lng: e.photo.lng }, lastTs: e.photo.ts });
+    }
+  }
+  return clusters;
+}
+
+function buildMomentPins() {
+  removeMomentPins();
+  momentLayer = L.layerGroup().addTo(playbackMap);
+  for (const c of clusterPhotoMoments(photoEntries)) {
+    const badge = c.entries.length > 1 ? `<span class="moment-count">${c.entries.length}</span>` : '';
+    const icon = L.divIcon({
+      className: 'moment-pin-wrap',
+      html: `<div class="moment-pin" style="background-image:url('${c.entries[0].url}')">${badge}</div>`,
+      iconSize: [46, 46],
+    });
+    const m = L.marker([c.center.lat, c.center.lng], { icon }).addTo(momentLayer);
+    m.on('click', () => openMomentSheet(c));
+  }
+}
+function removeMomentPins() {
+  if (momentLayer) { playbackMap.removeLayer(momentLayer); momentLayer = null; }
+}
+
+function openMomentSheet(cluster) {
+  const title = `${photoCaption(cluster.entries[0].photo)}${cluster.entries.length > 1 ? ` · ${cluster.entries.length} photos` : ''}`;
+  document.getElementById('momentSheetTitle').textContent = title;
+  const grid = document.getElementById('momentGrid');
+  grid.innerHTML = '';
+  for (const e of cluster.entries) {
+    const cell = document.createElement('div');
+    cell.className = 'moment-cell';
+    cell.style.backgroundImage = `url('${e.url}')`;
+    cell.addEventListener('click', () => openPhotoLightbox(e.photo, e.url));
+    grid.appendChild(cell);
+  }
+  document.getElementById('momentPlayBtn').onclick = () => {
+    closeMomentSheet();
+    enterPlaying(Math.max(0, cluster.entries[0].synth - 60000), true);
+  };
+  document.getElementById('momentSheet').classList.add('active');
+}
+function closeMomentSheet() {
+  document.getElementById('momentSheet').classList.remove('active');
+}
+
+/* ---- overview (atlas) <-> playing (ride-along) ---- */
+function buildChapterLines() {
+  removeChapterLines();
+  chapterLines = (playState.chapters || []).map((c) =>
+    L.polyline(c.latlngs, { color: '#E8934A', weight: 3, opacity: 0.35 }).addTo(playbackMap)
+  );
+  chapterLines.forEach((line, i) => {
+    line.on('click', () => {
+      setActiveChapter(i);
+      const card = document.querySelector(`.chapter-card[data-idx="${i}"]`);
+      if (card) card.scrollIntoView({ behavior: 'smooth', inline: 'center', block: 'nearest' });
+    });
+  });
+}
+function removeChapterLines() {
+  chapterLines.forEach((l) => playbackMap.removeLayer(l));
+  chapterLines = [];
+}
+
+function setActiveChapter(idx) {
+  if (idx === activeChapterIdx) return;
+  activeChapterIdx = idx;
+  document.querySelectorAll('.chapter-card').forEach((el) => el.classList.toggle('active', Number(el.dataset.idx) === idx));
+  chapterLines.forEach((line, i) => line.setStyle(i === idx ? { opacity: 0.95, weight: 4 } : { opacity: 0.35, weight: 3 }));
+}
+
+function renderStorylineStrip() {
+  const chapters = playState.chapters || [];
+  const strip = document.getElementById('storylineStrip');
+  strip.innerHTML = '';
+  chapters.forEach((c) => {
+    const thumbs = photosForChapter(c).slice(0, 3);
+    const card = document.createElement('div');
+    card.className = 'chapter-card';
+    card.dataset.idx = c.idx;
+    card.innerHTML = `
+      <div class="chapter-title">${escapeHtml(c.title)}</div>
+      <div class="chapter-meta">${escapeHtml(c.dateLabel)} · ${fmtDistance(c.distance)}</div>
+      ${thumbs.length ? `<div class="chapter-thumbs">${thumbs.map((t) => `<div style="background-image:url('${t.url}')"></div>`).join('')}</div>` : ''}`;
+    card.addEventListener('click', () => enterPlaying(c.synthStart, true));
+    strip.appendChild(card);
+  });
+
+  const startReal = tripStartRealTs();
+  const endReal = chapters.length ? chapters[chapters.length - 1].realEnd : startReal;
+  const days = nightsBetween(startReal, endReal) + 1;
+  const dist = chapters.reduce((s, c) => s + c.distance, 0);
+  const bits = [`${days} day${days === 1 ? '' : 's'}`, fmtDistance(dist)];
+  if (photoEntries.length) bits.push(`${photoEntries.length} photo${photoEntries.length === 1 ? '' : 's'}`);
+  document.getElementById('overviewStats').textContent = bits.join(' · ');
+}
+
+function highlightCenteredChapter() {
+  const strip = document.getElementById('storylineStrip');
+  const center = strip.scrollLeft + strip.clientWidth / 2;
+  let best = -1, bestDist = Infinity;
+  strip.querySelectorAll('.chapter-card').forEach((card) => {
+    const mid = card.offsetLeft + card.offsetWidth / 2;
+    const d = Math.abs(mid - center);
+    if (d < bestDist) { bestDist = d; best = Number(card.dataset.idx); }
+  });
+  if (best >= 0) setActiveChapter(best);
+}
+
+function enterOverview() {
+  pausePlayback();
+  dismissPhotoMemory();
+  hideSummary();
+  playbackMode = 'overview';
+  document.getElementById('playerPanel').style.display = 'none';
+  document.getElementById('overviewPanel').style.display = '';
+  document.getElementById('legBanner').classList.remove('active');
+  updateStayPulse(null);
+  activeLine.setLatLngs([]);
+  if (playbackMap.hasLayer(playMarker)) playbackMap.removeLayer(playMarker);
+  photoMarkers.forEach((m) => { if (playbackMap.hasLayer(m)) playbackMap.removeLayer(m); });
+  buildMomentPins();
+  buildChapterLines();
+  renderStorylineStrip();
+  followEnabled = false;
+  activeChapterIdx = -1;
+  setActiveChapter(0);
+  // flyToBounds rather than fitBounds: its animation is cancellable via map.stop(), so tearing
+  // the view down mid-flight (back to home, opening another trip) can't leave a dangling frame
+  if (playbackBounds) playbackMap.flyToBounds(playbackBounds, { padding: [30, 30], duration: 0.8 });
+}
+
+function enterPlaying(simTime, autoplay) {
+  playbackMode = 'playing';
+  hideSummary();
+  closeMomentSheet();
+  document.getElementById('overviewPanel').style.display = 'none';
+  document.getElementById('playerPanel').style.display = '';
+  removeMomentPins();
+  removeChapterLines();
+  if (!playbackMap.hasLayer(playMarker)) playMarker.addTo(playbackMap);
+  photoMarkers.forEach((m) => { if (!playbackMap.hasLayer(m)) m.addTo(playbackMap); });
+  playState.simTime = Math.max(0, Math.min(simTime, playState.maxMs));
+  if (playState.simTime === 0) memoryShownIds.clear();
+  else rearmMemoriesAfter(playState.simTime);
+  autoZoomCurrent = null;
+  playState.renderFn(playState.simTime);
+  if (autoplay) startPlayback();
+  else document.getElementById('playToggle').textContent = '▶';
+}
+
+/* ---- end-of-story summary ---- */
+function showSummary() {
+  const chapters = playState.chapters || [];
+  const startReal = tripStartRealTs();
+  const endReal = chapters.length ? chapters[chapters.length - 1].realEnd : startReal;
+  const days = nightsBetween(startReal, endReal) + 1;
+  const dist = currentHoliday
+    ? currentHoliday.legs.reduce((s, l) => s + l.distance, 0)
+    : (currentPlayTrip.distance || chapters.reduce((s, c) => s + c.distance, 0));
+  document.getElementById('summaryTitle').textContent = currentHoliday ? currentHoliday.collection.name : currentPlayTrip.name;
+  const bits = [`${days} day${days === 1 ? '' : 's'}`, fmtDistance(dist)];
+  if (photoEntries.length) bits.push(`${photoEntries.length} photo${photoEntries.length === 1 ? '' : 's'}`);
+  document.getElementById('summaryStats').textContent = bits.join(' · ');
+  document.getElementById('summaryOverviewBtn').style.display = overviewAvailable ? '' : 'none';
+  document.getElementById('summaryOverlay').classList.add('active');
+}
+function hideSummary() {
+  document.getElementById('summaryOverlay').classList.remove('active');
 }
 
 /* ---- auto-follow camera: zoom based on how much ground is covered in the next few seconds,
@@ -701,9 +987,11 @@ async function openPlayback(id) {
   setUniformMode(uniformModeEnabled);
   document.getElementById('scrubber').max = maxMs;
   document.getElementById('scrubber').value = 0;
-  renderFrame(0);
-  document.getElementById('playToggle').textContent = '\u25B6';
   await loadPhotoPins([currentPlayTrip.id], allPhotos);
+  playState.chapters = buildChapters();
+  overviewAvailable = playState.chapters.length > 1;
+  if (overviewAvailable) enterOverview();
+  else enterPlaying(0, false);
 }
 
 function renderFrame(simTime) {
@@ -813,9 +1101,10 @@ async function openHolidayPlayback(collectionId) {
   setUniformMode(uniformModeEnabled);
   document.getElementById('scrubber').max = maxMs;
   document.getElementById('scrubber').value = 0;
-  renderHolidayFrame(0);
-  document.getElementById('playToggle').textContent = '\u25B6';
   await loadPhotoPins(tripList.map((t) => t.id), allPhotos);
+  playState.chapters = buildChapters();
+  overviewAvailable = true; // a holiday always has a story worth an overview
+  enterOverview();
 }
 
 function legAtSimTime(simTime) {
@@ -885,6 +1174,7 @@ function playbackTick(nowReal) {
     playState.simTime = playState.maxMs;
     playState.renderFn(playState.simTime);
     pausePlayback();
+    showSummary();
     return;
   }
   playState.renderFn(playState.simTime);
@@ -1557,10 +1847,32 @@ window.addEventListener('DOMContentLoaded', () => {
   });
 
   document.getElementById('playbackBackBtn').addEventListener('click', () => {
+    if (playbackMode === 'playing' && overviewAvailable) {
+      enterOverview();
+      return;
+    }
     pausePlayback();
+    dismissPhotoMemory();
+    hideSummary();
+    if (playbackMap) playbackMap.stop(); // kill any in-flight camera animation before the view goes away
     currentHoliday = null;
     showView('home');
     renderHome();
+  });
+
+  document.getElementById('overviewPlayBtn').addEventListener('click', () => enterPlaying(0, true));
+  document.getElementById('storylineStrip').addEventListener('scroll', () => requestAnimationFrame(highlightCenteredChapter));
+  document.getElementById('momentCloseBtn').addEventListener('click', closeMomentSheet);
+  document.getElementById('summaryReplayBtn').addEventListener('click', () => {
+    hideSummary();
+    enterPlaying(0, true);
+  });
+  document.getElementById('summaryOverviewBtn').addEventListener('click', () => {
+    hideSummary();
+    enterOverview();
+  });
+  document.getElementById('summaryOverlay').addEventListener('click', (e) => {
+    if (e.target === e.currentTarget) hideSummary();
   });
 
   document.getElementById('playToggle').addEventListener('click', () => {
@@ -1699,8 +2011,10 @@ window.addEventListener('DOMContentLoaded', () => {
     if (lightboxPhoto && confirm('Delete this photo?')) {
       await dbDeleteStore('photos', lightboxPhoto.id);
       document.getElementById('photoLightbox').classList.remove('active');
+      closeMomentSheet();
       const ids = currentHoliday ? currentHoliday.legs.map((l) => l.tripId) : [currentPlayTrip.id];
       await loadPhotoPins(ids);
+      if (playbackMode === 'overview') enterOverview(); // re-cluster moments and refresh the strip
     }
   });
 
