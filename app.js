@@ -1,6 +1,6 @@
 /* ---------- IndexedDB ---------- */
 const DB_NAME = 'waypointDB';
-const DB_VERSION = 2;
+const DB_VERSION = 3;
 const STORE = 'trips';
 
 function dbOpen() {
@@ -11,6 +11,7 @@ function dbOpen() {
       if (!db.objectStoreNames.contains(STORE)) db.createObjectStore(STORE, { keyPath: 'id' });
       if (!db.objectStoreNames.contains('collections')) db.createObjectStore('collections', { keyPath: 'id' });
       if (!db.objectStoreNames.contains('photos')) db.createObjectStore('photos', { keyPath: 'id' });
+      if (!db.objectStoreNames.contains('places')) db.createObjectStore('places', { keyPath: 'id' });
     };
     req.onsuccess = () => resolve(req.result);
     req.onerror = () => reject(req.error);
@@ -31,6 +32,15 @@ async function dbGetAllStore(store) {
   return new Promise((resolve, reject) => {
     const tx = db.transaction(store, 'readonly');
     const req = tx.objectStore(store).getAll();
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+async function dbGetStore(store, key) {
+  const db = await dbOpen();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(store, 'readonly');
+    const req = tx.objectStore(store).get(key);
     req.onsuccess = () => resolve(req.result);
     req.onerror = () => reject(req.error);
   });
@@ -70,7 +80,11 @@ function bearing(a, b) {
   return ((Math.atan2(y, x) * 180) / Math.PI + 360) % 360;
 }
 function fmtDistance(m) {
-  return m >= 1000 ? (m / 1000).toFixed(2) + ' km' : Math.round(m) + ' m';
+  if (m < 1000) return Math.round(m) + ' m';
+  const km = m / 1000;
+  if (km >= 100) return Math.round(km) + ' km';
+  if (km >= 10) return km.toFixed(1) + ' km';
+  return km.toFixed(2) + ' km';
 }
 function fmtDuration(sec) {
   sec = Math.max(0, Math.round(sec));
@@ -366,34 +380,46 @@ let stayPulseMarker = null;
 let memoryShownIds = new Set();
 let memoryActive = null;
 let memoryTimer = null;
-let uniformModeEnabled = false;
+let playbackMode = 'playing'; // 'overview' (atlas: whole path + storyline strip) | 'playing' (ride-along)
+let overviewAvailable = false;
+let playbackBounds = null;
+let momentLayer = null;
+let chapterLines = [];
+let activeChapterIdx = -1;
 let followEnabled = false;
 let autoZoomCurrent = null;
-let playState = { playing: false, speed: 20, rafId: null, simTime: 0, lastFrameReal: 0, maxMs: 0, renderFn: null };
+let playState = { playing: false, speed: 1, rafId: null, simTime: 0, lastFrameReal: 0, maxMs: 0, renderFn: null };
+
+/* binary search: the interpolators below run per animation frame on merged trips that can carry
+ * thousands of points, so a linear scan is the difference between smooth and stuttery */
+function lowerBoundIdx(points, target, key) {
+  let lo = 0, hi = points.length - 1;
+  while (hi - lo > 1) {
+    const mid = (lo + hi) >> 1;
+    if (key(points[mid]) <= target) lo = mid;
+    else hi = mid;
+  }
+  return lo;
+}
 
 function pointAtSimTime(points, simTime) {
-  const t0 = points[0].ts;
-  const target = t0 + simTime;
+  const target = points[0].ts + simTime;
   if (target <= points[0].ts) return { idx: 0, pos: points[0] };
   if (target >= points[points.length - 1].ts) return { idx: points.length - 1, pos: points[points.length - 1] };
-  for (let i = 0; i < points.length - 1; i++) {
-    if (points[i].ts <= target && points[i + 1].ts >= target) {
-      const a = points[i], b = points[i + 1];
-      const span = b.ts - a.ts || 1;
-      const f = (target - a.ts) / span;
-      return {
-        idx: i,
-        pos: {
-          lat: a.lat + (b.lat - a.lat) * f,
-          lng: a.lng + (b.lng - a.lng) * f,
-          speed: a.speed,
-          ts: target,
-          realTs: a.realTs != null ? a.realTs + (b.realTs - a.realTs) * f : target,
-        },
-      };
-    }
-  }
-  return { idx: points.length - 1, pos: points[points.length - 1] };
+  const i = lowerBoundIdx(points, target, (p) => p.ts);
+  const a = points[i], b = points[i + 1];
+  const span = b.ts - a.ts || 1;
+  const f = (target - a.ts) / span;
+  return {
+    idx: i,
+    pos: {
+      lat: a.lat + (b.lat - a.lat) * f,
+      lng: a.lng + (b.lng - a.lng) * f,
+      speed: a.speed,
+      ts: target,
+      realTs: a.realTs != null ? a.realTs + (b.realTs - a.realTs) * f : target,
+    },
+  };
 }
 
 /* ---- stay/jump detection + compressed display timeline ----
@@ -457,6 +483,8 @@ function buildTripTimeline(points) {
   }
   const events = spans.map((sp) => ({
     kind: sp.kind,
+    startIdx: sp.startIdx,
+    endIdx: sp.endIdx,
     synthStart: out[sp.startIdx].ts,
     synthEnd: out[sp.endIdx].ts,
     realStart: points[sp.startIdx].ts,
@@ -464,6 +492,8 @@ function buildTripTimeline(points) {
     realSpanMs: points[sp.endIdx].ts - points[sp.startIdx].ts,
     lat: points[sp.startIdx].lat,
     lng: points[sp.startIdx].lng,
+    latEnd: points[sp.endIdx].lat,
+    lngEnd: points[sp.endIdx].lng,
   }));
   return { points: out, events, maxMs: out[out.length - 1].ts };
 }
@@ -473,20 +503,80 @@ function synthTimeForRealTs(points, realTs) {
   if (realTs <= key(points[0])) return points[0].ts;
   const last = points[points.length - 1];
   if (realTs >= key(last)) return last.ts;
-  for (let i = 0; i < points.length - 1; i++) {
-    const a = points[i], b = points[i + 1];
-    if (key(a) <= realTs && key(b) >= realTs) {
-      const span = key(b) - key(a) || 1;
-      return a.ts + (b.ts - a.ts) * ((realTs - key(a)) / span);
-    }
-  }
-  return last.ts;
+  const i = lowerBoundIdx(points, realTs, key);
+  const a = points[i], b = points[i + 1];
+  const span = key(b) - key(a) || 1;
+  return a.ts + (b.ts - a.ts) * ((realTs - key(a)) / span);
 }
 
 function eventAtSimTime(simTime) {
   const list = currentHoliday ? currentHoliday.events : playState.events;
   if (!list) return null;
   return list.find((e) => simTime >= e.synthStart && simTime <= e.synthEnd) || null;
+}
+
+/* ---- place names: cached reverse geocoding so the story says "Stayed in Siena", not "here" ----
+ * Same etiquette as the OSRM road-snap: the free Nominatim endpoint at 1 req/s, results cached
+ * in IndexedDB so each place is fetched once ever, and everything degrades to the generic label
+ * when offline. Lookups resolve in the background; banners pick names up on their next frame. */
+const placeNames = new Map(); // key -> resolved name (or null for "looked up, nothing usable")
+const placePending = new Set();
+let placeQueue = Promise.resolve();
+
+function placeKey(lat, lng) {
+  return `${lat.toFixed(3)},${lng.toFixed(3)}`; // ~100 m grid: one lookup covers a whole stop
+}
+function placeNameSync(lat, lng) {
+  return placeNames.get(placeKey(lat, lng)) || null;
+}
+
+function requestPlaceName(lat, lng, onResolve) {
+  const key = placeKey(lat, lng);
+  if (placeNames.has(key)) {
+    if (onResolve) onResolve(placeNames.get(key));
+    return;
+  }
+  if (placePending.has(key)) return;
+  placePending.add(key);
+  placeQueue = placeQueue.then(async () => {
+    try {
+      const cached = await dbGetStore('places', key);
+      if (cached) {
+        placeNames.set(key, cached.name);
+      } else {
+        const res = await fetch(`https://nominatim.openstreetmap.org/reverse?format=jsonv2&lat=${lat}&lon=${lng}&zoom=12`);
+        if (res.ok) {
+          const data = await res.json();
+          const a = data.address || {};
+          const name = a.city || a.town || a.village || a.suburb || a.municipality || a.county || null;
+          placeNames.set(key, name);
+          await dbPutStore('places', { id: key, name, fetchedAt: Date.now() });
+        }
+        await new Promise((r) => setTimeout(r, 1100)); // the free endpoint allows 1 req/s
+      }
+    } catch (e) {
+      /* offline — labels stay generic and we'll retry on a future visit */
+    }
+    placePending.delete(key);
+    if (onResolve) onResolve(placeNames.get(key) ?? null);
+  });
+}
+
+function queuePlaceLookups() {
+  const refresh = () => {
+    if (playbackMode === 'overview') renderStorylineStrip();
+  };
+  const events = (currentHoliday ? currentHoliday.events : playState.events) || [];
+  for (const ev of events) {
+    requestPlaceName(ev.lat, ev.lng, refresh);
+    if (ev.kind === 'jump' && ev.latEnd != null) requestPlaceName(ev.latEnd, ev.lngEnd, refresh);
+  }
+  for (const c of playState.chapters || []) {
+    if (!c.latlngs || !c.latlngs.length) continue;
+    requestPlaceName(c.latlngs[0][0], c.latlngs[0][1], refresh);
+    const end = c.latlngs[c.latlngs.length - 1];
+    requestPlaceName(end[0], end[1], refresh);
+  }
 }
 
 function nightsBetween(a, b) {
@@ -501,10 +591,18 @@ function fmtSpanShort(ms) {
   return Math.max(1, Math.round(ms / 60000)) + ' min';
 }
 function stayLabel(ev) {
-  if (ev.kind === 'jump') return `Traveling · +${fmtSpanShort(ev.realSpanMs)}`;
+  if (ev.kind === 'jump') {
+    const dest = ev.latEnd != null ? placeNameSync(ev.latEnd, ev.lngEnd) : null;
+    if (dest) return `Traveling to ${dest} · +${fmtSpanShort(ev.realSpanMs)}`;
+    const d = ev.latEnd != null ? haversine({ lat: ev.lat, lng: ev.lng }, { lat: ev.latEnd, lng: ev.lngEnd }) : 0;
+    const dPart = d >= 1000 ? `${fmtDistance(d)} · ` : '';
+    return `Traveling ${dPart}+${fmtSpanShort(ev.realSpanMs)}`;
+  }
+  const place = placeNameSync(ev.lat, ev.lng);
+  const where = place ? `in ${place}` : 'here';
   const nights = nightsBetween(ev.realStart, ev.realEnd);
-  if (nights >= 1 && ev.realSpanMs >= 18 * 3600000) return `Stayed here · ${nights} night${nights === 1 ? '' : 's'}`;
-  return `Stayed here · ${fmtSpanShort(ev.realSpanMs)}`;
+  if (nights >= 1 && ev.realSpanMs >= 18 * 3600000) return `Stayed ${where} · ${nights} night${nights === 1 ? '' : 's'}`;
+  return `Stayed ${where} · ${fmtSpanShort(ev.realSpanMs)}`;
 }
 
 /* ---- adaptive playback pace: slow near photos/turns ----
@@ -586,27 +684,45 @@ function currentPaceMultiplier(simTime) {
   return paceMultiplierAt(playState.paceProfile, simTime);
 }
 
-/* ---- uniform stage duration: normalize a leg's (or a whole single trip's) real length to one target wall-clock duration ----
- * Capped well below the general speed range: a very long leg (e.g. a multi-hour flight) would
- * otherwise need a huge multiplier to fit the target duration, moving faster than map tiles can
- * load. Past the cap it just takes a bit longer than the target instead of breaking the map. */
-const UNIFORM_TARGET_MS = 35000;
-const UNIFORM_MAX_SPEED = 150;
-function clampUniformSpeed(v) {
-  return Math.min(UNIFORM_MAX_SPEED, Math.max(1, v));
+/* ---- story pacing: the viewer's time is the fixed budget, the trip flexes to fit it ----
+ * Each chapter gets a display duration on a log curve of its distance, so a 1 km stroll takes
+ * ~12 s and a 1,000 km drive ~35 s rather than 1000x. If the whole story would still run long,
+ * everything scales down proportionally. Speed is capped so tiles can keep up (a very long leg
+ * just runs a bit over its target instead of outrunning the map), and the user's speed buttons
+ * are relative nudges (0.5x / 1x / 2x story time) on top. */
+const STORY_MAX_SPEED = 150;
+const STORY_GAP_SPEED = 20; // through compressed stays/jumps and inter-leg gaps (~2-2.5 s each)
+const STORY_TOTAL_BUDGET_S = 150;
+
+function storySecondsForDistance(m) {
+  const km = m / 1000;
+  return Math.min(35, Math.max(10, 8 + 6 * Math.log(1 + km)));
 }
-function currentBaseSpeed(simTime) {
-  if (!uniformModeEnabled) return playState.speed;
-  if (currentHoliday) {
-    const leg = legAtSimTime(simTime);
-    if (leg) return clampUniformSpeed((leg.synthEnd - leg.synthStart) / UNIFORM_TARGET_MS);
-    return playState.speed; // in the gap between legs — no single stage to normalize to
+
+function assignStoryPacing(chapters) {
+  let total = 0;
+  for (const c of chapters) {
+    c.storySec = storySecondsForDistance(c.distance);
+    total += c.storySec;
   }
-  return clampUniformSpeed(playState.maxMs / UNIFORM_TARGET_MS);
+  if (total > STORY_TOTAL_BUDGET_S) {
+    const f = STORY_TOTAL_BUDGET_S / total;
+    for (const c of chapters) c.storySec *= f;
+  }
+  for (const c of chapters) {
+    const span = c.synthEnd - c.synthStart;
+    c.storySpeed = Math.min(STORY_MAX_SPEED, Math.max(1, span / (c.storySec * 1000)));
+  }
+}
+
+function currentBaseSpeed(simTime) {
+  const mult = playState.speed || 1;
+  const c = chapterAtSimTime(simTime);
+  return (c ? c.storySpeed : STORY_GAP_SPEED) * mult;
 }
 
 function setupPlaybackMap(legsForGhost) {
-  if (playbackMap) { playbackMap.remove(); playbackMap = null; }
+  if (playbackMap) { playbackMap.stop(); playbackMap.remove(); playbackMap = null; }
   playbackMap = L.map('playbackMap', { zoomControl: false }).setView([20, 0], 3);
   playbackMap.getContainer().classList.add('map-dark');
   L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
@@ -626,8 +742,13 @@ function setupPlaybackMap(legsForGhost) {
   const firstPt = legsForGhost[0].points[0];
   playMarker = L.circleMarker([firstPt.lat, firstPt.lng], { radius: 7, color: '#F0EAD8', fillColor: '#E8934A', fillOpacity: 1, weight: 2 }).addTo(playbackMap);
   if (allBounds) playbackMap.fitBounds(allBounds, { padding: [30, 30] });
+  playbackBounds = allBounds;
   photoMarkers = [];
   stayPulseMarker = null;
+  travelArc = null;
+  momentLayer = null;
+  chapterLines = [];
+  activeChapterIdx = -1;
   followEnabled = false;
   autoZoomCurrent = null;
 }
@@ -647,6 +768,423 @@ function updateStayPulse(ev) {
   }
 }
 
+/* ---- travel arcs: the "Indiana Jones map" cut for big unrecorded jumps ----
+ * When playback crosses a gap whose displacement is flight/long-drive sized, the camera pulls
+ * out to frame both endpoints and a dashed arc sweeps across, instead of the dot teleporting. */
+const ARC_MIN_DIST_M = 50000;
+let travelArc = null;
+
+function travelGapAt(simTime) {
+  if (currentHoliday && !legAtSimTime(simTime)) {
+    const prev = [...currentHoliday.legs].reverse().find((l) => l.synthEnd <= simTime);
+    const next = currentHoliday.legs.find((l) => l.synthStart > simTime);
+    if (!prev || !next) return null;
+    const from = prev.points[prev.points.length - 1];
+    const to = next.points[0];
+    return { key: 'gap' + prev.synthEnd, start: prev.synthEnd, end: next.synthStart, from, to };
+  }
+  const ev = eventAtSimTime(simTime);
+  if (ev && ev.kind === 'jump' && ev.latEnd != null) {
+    return { key: 'ev' + ev.synthStart, start: ev.synthStart, end: ev.synthEnd, from: { lat: ev.lat, lng: ev.lng }, to: { lat: ev.latEnd, lng: ev.lngEnd } };
+  }
+  return null;
+}
+
+function arcLatLngs(from, to, f) {
+  const ctrl = {
+    lat: (from.lat + to.lat) / 2 - (to.lng - from.lng) * 0.18,
+    lng: (from.lng + to.lng) / 2 + (to.lat - from.lat) * 0.18,
+  };
+  const steps = 48;
+  const upto = Math.max(1, Math.round(f * steps));
+  const out = [];
+  for (let i = 0; i <= upto; i++) {
+    const t = i / steps;
+    const a = (1 - t) * (1 - t), b = 2 * (1 - t) * t, c = t * t;
+    out.push([a * from.lat + b * ctrl.lat + c * to.lat, a * from.lng + b * ctrl.lng + c * to.lng]);
+  }
+  return out;
+}
+
+/* Returns the arc tip position while a big jump is on screen, else null. */
+function updateTravelArc(simTime) {
+  const gap = travelGapAt(simTime);
+  const big = gap && haversine(gap.from, gap.to) >= ARC_MIN_DIST_M ? gap : null;
+  if (!big) {
+    if (travelArc) {
+      playbackMap.removeLayer(travelArc.line);
+      travelArc = null;
+      autoZoomCurrent = null; // reseed the follow camera after the wide shot
+      if (playState.playing) followEnabled = true;
+    }
+    return null;
+  }
+  if (!travelArc || travelArc.key !== big.key) {
+    if (travelArc) playbackMap.removeLayer(travelArc.line);
+    travelArc = { key: big.key, line: L.polyline([], { color: '#E8934A', weight: 3, dashArray: '6,9', opacity: 0.9 }).addTo(playbackMap) };
+    followEnabled = false;
+    playbackMap.flyToBounds(L.latLngBounds([big.from.lat, big.from.lng], [big.to.lat, big.to.lng]).pad(0.35), { duration: 0.9 });
+  }
+  const f = Math.max(0, Math.min(1, (simTime - big.start) / Math.max(1, big.end - big.start)));
+  const pts = arcLatLngs(big.from, big.to, f);
+  travelArc.line.setLatLngs(pts);
+  return pts[pts.length - 1];
+}
+
+/* ---- chapters: the storyline units a viewer scans and jumps between ----
+ * A holiday chapters by leg; a merged/single trip chapters by the movement segments between
+ * its stay/jump events. Chapters drive the overview strip, seeking, and (via storySec) pacing. */
+function buildChapters() {
+  const chapters = [];
+  if (currentHoliday) {
+    currentHoliday.legs.forEach((leg, i) => {
+      chapters.push({
+        idx: i,
+        title: leg.name,
+        dateLabel: fmtDate(leg.realStart),
+        synthStart: leg.synthStart,
+        synthEnd: leg.synthEnd,
+        realStart: leg.points[0].realTs,
+        realEnd: leg.points[leg.points.length - 1].realTs,
+        distance: leg.distance,
+        latlngs: leg.points.map((p) => [p.lat, p.lng]),
+      });
+    });
+    return chapters;
+  }
+
+  const pts = playState.displayPoints;
+  const segs = [];
+  let segStart = 0;
+  for (const ev of playState.events) {
+    if (ev.startIdx > segStart) segs.push([segStart, ev.startIdx]);
+    segStart = ev.endIdx;
+  }
+  if (segStart < pts.length - 1) segs.push([segStart, pts.length - 1]);
+
+  for (const [a, b] of segs) {
+    const slice = pts.slice(a, b + 1);
+    const d = pathDistance(slice);
+    const last = chapters[chapters.length - 1];
+    if (d < 50 && last) {
+      // GPS jitter around a stop, not a real movement segment — absorb into the previous chapter
+      last.synthEnd = pts[b].ts;
+      last.realEnd = pts[b].realTs;
+      last.distance += d;
+      continue;
+    }
+    chapters.push({
+      synthStart: pts[a].ts,
+      synthEnd: pts[b].ts,
+      realStart: pts[a].realTs,
+      realEnd: pts[b].realTs,
+      distance: d,
+      latlngs: slice.map((p) => [p.lat, p.lng]),
+    });
+  }
+
+  const multiDay = nightsBetween(pts[0].realTs, pts[pts.length - 1].realTs) >= 1;
+  const dayCounts = {};
+  for (const c of chapters) {
+    const day = nightsBetween(pts[0].realTs, c.realStart) + 1;
+    dayCounts[day] = (dayCounts[day] || 0) + 1;
+  }
+  chapters.forEach((c, i) => {
+    c.idx = i;
+    const day = nightsBetween(pts[0].realTs, c.realStart) + 1;
+    c.title = multiDay ? `Day ${day}` : `Stage ${i + 1}`;
+    // several chapters on one day would be indistinguishable — show the start time instead of the date
+    c.dateLabel = multiDay && dayCounts[day] === 1 ? fmtDate(c.realStart) : fmtClock(c.realStart);
+  });
+  return chapters;
+}
+
+function chapterAtSimTime(simTime) {
+  if (!playState.chapters) return null;
+  return playState.chapters.find((c) => simTime >= c.synthStart && simTime <= c.synthEnd) || null;
+}
+
+function photosForChapter(c) {
+  return photoEntries.filter((e) => e.synth != null && e.synth >= c.synthStart && e.synth <= c.synthEnd);
+}
+
+/* ---- photo moments: photos clustered in space and time, shown as one pin at atlas altitude ----
+ * The cluster radius derives from the trip's bounding box so a walking tour clusters per café
+ * and a road trip clusters per town. */
+function clusterPhotoMoments(entries) {
+  let radius = 60;
+  if (playbackBounds) {
+    const nw = playbackBounds.getNorthWest(), se = playbackBounds.getSouthEast();
+    radius = Math.max(60, haversine({ lat: nw.lat, lng: nw.lng }, { lat: se.lat, lng: se.lng }) / 50);
+  }
+  const clusters = [];
+  const sorted = entries.filter((e) => e.synth != null).slice().sort((a, b) => a.photo.ts - b.photo.ts);
+  for (const e of sorted) {
+    const c = clusters.find(
+      (cl) => e.photo.ts - cl.lastTs <= 6 * 3600000 && haversine(cl.center, { lat: e.photo.lat, lng: e.photo.lng }) <= radius
+    );
+    if (c) {
+      c.entries.push(e);
+      c.lastTs = e.photo.ts;
+      c.center = {
+        lat: c.entries.reduce((s, x) => s + x.photo.lat, 0) / c.entries.length,
+        lng: c.entries.reduce((s, x) => s + x.photo.lng, 0) / c.entries.length,
+      };
+    } else {
+      clusters.push({ entries: [e], center: { lat: e.photo.lat, lng: e.photo.lng }, lastTs: e.photo.ts });
+    }
+  }
+  return clusters;
+}
+
+function buildMomentPins() {
+  removeMomentPins();
+  momentLayer = L.layerGroup().addTo(playbackMap);
+  for (const c of clusterPhotoMoments(photoEntries)) {
+    const badge = c.entries.length > 1 ? `<span class="moment-count">${c.entries.length}</span>` : '';
+    const icon = L.divIcon({
+      className: 'moment-pin-wrap',
+      html: `<div class="moment-pin" style="background-image:url('${c.entries[0].url}')">${badge}</div>`,
+      iconSize: [46, 46],
+    });
+    const m = L.marker([c.center.lat, c.center.lng], { icon }).addTo(momentLayer);
+    m.on('click', () => openMomentSheet(c));
+  }
+}
+function removeMomentPins() {
+  if (momentLayer) { playbackMap.removeLayer(momentLayer); momentLayer = null; }
+}
+
+function openMomentSheet(cluster) {
+  const title = `${photoCaption(cluster.entries[0].photo)}${cluster.entries.length > 1 ? ` · ${cluster.entries.length} photos` : ''}`;
+  document.getElementById('momentSheetTitle').textContent = title;
+  const grid = document.getElementById('momentGrid');
+  grid.innerHTML = '';
+  for (const e of cluster.entries) {
+    const cell = document.createElement('div');
+    cell.className = 'moment-cell';
+    cell.style.backgroundImage = `url('${e.url}')`;
+    cell.addEventListener('click', () => openPhotoLightbox(e.photo, e.url));
+    grid.appendChild(cell);
+  }
+  document.getElementById('momentPlayBtn').onclick = () => {
+    closeMomentSheet();
+    enterPlaying(Math.max(0, cluster.entries[0].synth - 60000), true);
+  };
+  document.getElementById('momentSheet').classList.add('active');
+}
+function closeMomentSheet() {
+  document.getElementById('momentSheet').classList.remove('active');
+}
+
+/* ---- overview (atlas) <-> playing (ride-along) ---- */
+function buildChapterLines() {
+  removeChapterLines();
+  chapterLines = (playState.chapters || []).map((c) =>
+    L.polyline(c.latlngs, { color: '#E8934A', weight: 3, opacity: 0.35 }).addTo(playbackMap)
+  );
+  chapterLines.forEach((line, i) => {
+    line.on('click', () => {
+      setActiveChapter(i);
+      const card = document.querySelector(`.chapter-card[data-idx="${i}"]`);
+      if (card) card.scrollIntoView({ behavior: 'smooth', inline: 'center', block: 'nearest' });
+    });
+  });
+}
+function removeChapterLines() {
+  chapterLines.forEach((l) => playbackMap.removeLayer(l));
+  chapterLines = [];
+}
+
+function setActiveChapter(idx) {
+  if (idx === activeChapterIdx) return;
+  activeChapterIdx = idx;
+  document.querySelectorAll('.chapter-card').forEach((el) => el.classList.toggle('active', Number(el.dataset.idx) === idx));
+  chapterLines.forEach((line, i) => line.setStyle(i === idx ? { opacity: 0.95, weight: 4 } : { opacity: 0.35, weight: 3 }));
+}
+
+function renderStorylineStrip() {
+  const chapters = playState.chapters || [];
+  const strip = document.getElementById('storylineStrip');
+  strip.innerHTML = '';
+  chapters.forEach((c) => {
+    const thumbs = photosForChapter(c).slice(0, 3);
+    const card = document.createElement('div');
+    card.className = 'chapter-card';
+    card.dataset.idx = c.idx;
+    // holiday legs carry the user's own names; only generic Day/Stage titles earn a place suffix
+    const place = !currentHoliday && c.latlngs && c.latlngs.length ? placeNameSync(c.latlngs[0][0], c.latlngs[0][1]) : null;
+    card.innerHTML = `
+      <div class="chapter-title">${escapeHtml(c.title)}${place ? ` · ${escapeHtml(place)}` : ''}</div>
+      <div class="chapter-meta">${escapeHtml(c.dateLabel)} · ${fmtDistance(c.distance)}</div>
+      ${thumbs.length ? `<div class="chapter-thumbs">${thumbs.map((t) => `<div style="background-image:url('${t.url}')"></div>`).join('')}</div>` : ''}`;
+    card.addEventListener('click', () => enterPlaying(c.synthStart, true));
+    strip.appendChild(card);
+  });
+
+  const startReal = tripStartRealTs();
+  const endReal = chapters.length ? chapters[chapters.length - 1].realEnd : startReal;
+  const days = nightsBetween(startReal, endReal) + 1;
+  const dist = chapters.reduce((s, c) => s + c.distance, 0);
+  const bits = [`${days} day${days === 1 ? '' : 's'}`, fmtDistance(dist)];
+  if (photoEntries.length) bits.push(`${photoEntries.length} photo${photoEntries.length === 1 ? '' : 's'}`);
+  document.getElementById('overviewStats').textContent = bits.join(' · ');
+}
+
+function highlightCenteredChapter() {
+  const strip = document.getElementById('storylineStrip');
+  const center = strip.scrollLeft + strip.clientWidth / 2;
+  let best = -1, bestDist = Infinity;
+  strip.querySelectorAll('.chapter-card').forEach((card) => {
+    const mid = card.offsetLeft + card.offsetWidth / 2;
+    const d = Math.abs(mid - center);
+    if (d < bestDist) { bestDist = d; best = Number(card.dataset.idx); }
+  });
+  if (best >= 0) setActiveChapter(best);
+}
+
+function enterOverview() {
+  pausePlayback();
+  dismissPhotoMemory();
+  hideSummary();
+  playbackMode = 'overview';
+  document.getElementById('playerPanel').style.display = 'none';
+  document.getElementById('overviewPanel').style.display = '';
+  document.getElementById('legBanner').classList.remove('active');
+  updateStayPulse(null);
+  activeLine.setLatLngs([]);
+  if (playbackMap.hasLayer(playMarker)) playbackMap.removeLayer(playMarker);
+  photoMarkers.forEach((m) => { if (playbackMap.hasLayer(m)) playbackMap.removeLayer(m); });
+  buildMomentPins();
+  buildChapterLines();
+  renderStorylineStrip();
+  followEnabled = false;
+  activeChapterIdx = -1;
+  setActiveChapter(0);
+  // flyToBounds rather than fitBounds: its animation is cancellable via map.stop(), so tearing
+  // the view down mid-flight (back to home, opening another trip) can't leave a dangling frame
+  if (playbackBounds) playbackMap.flyToBounds(playbackBounds, { padding: [30, 30], duration: 0.8 });
+}
+
+function enterPlaying(simTime, autoplay) {
+  playbackMode = 'playing';
+  hideSummary();
+  closeMomentSheet();
+  document.getElementById('overviewPanel').style.display = 'none';
+  document.getElementById('playerPanel').style.display = '';
+  removeMomentPins();
+  removeChapterLines();
+  if (!playbackMap.hasLayer(playMarker)) playMarker.addTo(playbackMap);
+  photoMarkers.forEach((m) => { if (!playbackMap.hasLayer(m)) m.addTo(playbackMap); });
+  playState.simTime = Math.max(0, Math.min(simTime, playState.maxMs));
+  if (playState.simTime === 0) memoryShownIds.clear();
+  else rearmMemoriesAfter(playState.simTime);
+  autoZoomCurrent = null;
+  playState.renderFn(playState.simTime);
+  if (autoplay) startPlayback();
+  else document.getElementById('playToggle').textContent = '▶';
+}
+
+/* ---- segmented story scrubber: one segment per chapter sized by its display time, with photo
+ * dots and stay ticks, so the structure of the story is visible before pressing play ---- */
+let scrubSegs = [];
+
+function buildScrubber() {
+  const el = document.getElementById('storyScrubber');
+  el.innerHTML = '';
+  scrubSegs = [];
+  const chapters = playState.chapters || [];
+  const spans = [];
+  let cursor = 0;
+  for (const c of chapters) {
+    if (c.synthStart > cursor + 1) spans.push({ start: cursor, end: c.synthStart, gap: true });
+    spans.push({ start: c.synthStart, end: c.synthEnd, gap: false, weight: c.storySec || 1 });
+    cursor = c.synthEnd;
+  }
+  if (cursor < playState.maxMs - 1) spans.push({ start: cursor, end: playState.maxMs, gap: true });
+
+  const events = (currentHoliday ? currentHoliday.events : playState.events) || [];
+  for (const sp of spans) {
+    const seg = document.createElement('div');
+    seg.className = 'scrub-seg' + (sp.gap ? ' gap' : '');
+    if (!sp.gap) seg.style.flexGrow = String(sp.weight);
+    const fill = document.createElement('div');
+    fill.className = 'scrub-fill';
+    seg.appendChild(fill);
+    if (!sp.gap) {
+      const at = (t) => (((t - sp.start) / (sp.end - sp.start)) * 100) + '%';
+      for (const e of photoEntries) {
+        if (e.synth != null && e.synth >= sp.start && e.synth <= sp.end) {
+          const dot = document.createElement('span');
+          dot.className = 'scrub-dot';
+          dot.style.left = at(e.synth);
+          seg.appendChild(dot);
+        }
+      }
+      for (const ev of events) {
+        if (ev.synthStart > sp.start && ev.synthEnd < sp.end) {
+          const tick = document.createElement('span');
+          tick.className = 'scrub-tick';
+          tick.style.left = at((ev.synthStart + ev.synthEnd) / 2);
+          seg.appendChild(tick);
+        }
+      }
+    }
+    el.appendChild(seg);
+    scrubSegs.push({ el: seg, fill, start: sp.start, end: sp.end });
+  }
+}
+
+function updateScrubberValue(sim) {
+  for (const s of scrubSegs) {
+    const f = s.end > s.start ? Math.max(0, Math.min(1, (sim - s.start) / (s.end - s.start))) : sim >= s.end ? 1 : 0;
+    s.fill.style.width = f * 100 + '%';
+  }
+}
+
+function simFromScrubberX(clientX) {
+  for (let i = 0; i < scrubSegs.length; i++) {
+    const s = scrubSegs[i];
+    const r = s.el.getBoundingClientRect();
+    if (clientX <= r.right || i === scrubSegs.length - 1) {
+      if (clientX < r.left) return s.start;
+      const f = Math.max(0, Math.min(1, (clientX - r.left) / Math.max(1, r.width)));
+      return s.start + f * (s.end - s.start);
+    }
+  }
+  return playState.maxMs;
+}
+
+/* ---- end-of-story summary ---- */
+function showSummary() {
+  const chapters = playState.chapters || [];
+  const startReal = tripStartRealTs();
+  const endReal = chapters.length ? chapters[chapters.length - 1].realEnd : startReal;
+  const days = nightsBetween(startReal, endReal) + 1;
+  const dist = currentHoliday
+    ? currentHoliday.legs.reduce((s, l) => s + l.distance, 0)
+    : (currentPlayTrip.distance || chapters.reduce((s, c) => s + c.distance, 0));
+  document.getElementById('summaryTitle').textContent = currentHoliday ? currentHoliday.collection.name : currentPlayTrip.name;
+  const bits = [`${days} day${days === 1 ? '' : 's'}`, fmtDistance(dist)];
+  if (photoEntries.length) bits.push(`${photoEntries.length} photo${photoEntries.length === 1 ? '' : 's'}`);
+  document.getElementById('summaryStats').textContent = bits.join(' · ');
+  let route = '';
+  if (chapters.length && chapters[0].latlngs && chapters[0].latlngs.length) {
+    const first = chapters[0].latlngs[0];
+    const lastC = chapters[chapters.length - 1];
+    const last = lastC.latlngs[lastC.latlngs.length - 1];
+    const a = placeNameSync(first[0], first[1]);
+    const b = placeNameSync(last[0], last[1]);
+    if (a && b) route = a === b ? a : `${a} → ${b}`;
+  }
+  document.getElementById('summaryRoute').textContent = route;
+  document.getElementById('summaryOverviewBtn').style.display = overviewAvailable ? '' : 'none';
+  document.getElementById('summaryOverlay').classList.add('active');
+}
+function hideSummary() {
+  document.getElementById('summaryOverlay').classList.remove('active');
+}
+
 /* ---- auto-follow camera: zoom based on how much ground is covered in the next few seconds,
  * so a fast leg (flight/highway) doesn't fly off-screen and a slow one isn't zoomed out to nothing ---- */
 const FOLLOW_LOOKAHEAD_MS = 30000;
@@ -660,7 +1198,7 @@ function computeTargetZoom(pos, aheadPos) {
   const metersPerPixel = spanMeters / (minDim * 0.22);
   const latRad = (pos.lat * Math.PI) / 180;
   const zoom = Math.log2((156543.03392 * Math.cos(latRad)) / metersPerPixel);
-  return Math.min(14, Math.max(5, zoom));
+  return Math.min(17, Math.max(4, zoom));
 }
 
 function updateAutoFollow(pos, aheadPos) {
@@ -696,14 +1234,16 @@ async function openPlayback(id) {
   const paceProfile = buildPaceProfile(timeline.points, tripPhotos, 0);
 
   const maxMs = timeline.maxMs;
-  playState = { playing: false, speed: 20, rafId: null, simTime: 0, lastFrameReal: 0, maxMs, renderFn: renderFrame, paceProfile, displayPoints: timeline.points, events: timeline.events };
-  setSpeedButtons(20);
-  setUniformMode(uniformModeEnabled);
-  document.getElementById('scrubber').max = maxMs;
-  document.getElementById('scrubber').value = 0;
-  renderFrame(0);
-  document.getElementById('playToggle').textContent = '\u25B6';
+  playState = { playing: false, speed: 1, rafId: null, simTime: 0, lastFrameReal: 0, maxMs, renderFn: renderFrame, paceProfile, displayPoints: timeline.points, events: timeline.events };
+  setSpeedButtons(1);
   await loadPhotoPins([currentPlayTrip.id], allPhotos);
+  playState.chapters = buildChapters();
+  assignStoryPacing(playState.chapters);
+  buildScrubber();
+  queuePlaceLookups();
+  overviewAvailable = playState.chapters.length > 1;
+  if (overviewAvailable) enterOverview();
+  else enterPlaying(0, false);
 }
 
 function renderFrame(simTime) {
@@ -727,9 +1267,11 @@ function renderFrame(simTime) {
   } else {
     banner.classList.remove('active');
   }
-  updateStayPulse(ev);
+  const arcTip = updateTravelArc(simTime);
+  if (arcTip) playMarker.setLatLng(arcTip);
+  updateStayPulse(travelArc ? null : ev);
 
-  document.getElementById('scrubber').value = simTime;
+  updateScrubberValue(simTime);
   document.getElementById('readoutClock').textContent = fmtClock(pos.realTs ?? pos.ts);
   document.getElementById('readoutDist').textContent = fmtDistance(dist);
   document.getElementById('readoutSpeed').textContent = ev ? '\u2014' : fmtSpeed(computeSpeedKmh(pts, pos.realTs ?? pos.ts));
@@ -808,14 +1350,15 @@ async function openHolidayPlayback(collectionId) {
   showView('playback');
   setupPlaybackMap(legs);
 
-  playState = { playing: false, speed: 20, rafId: null, simTime: 0, lastFrameReal: 0, maxMs, renderFn: renderHolidayFrame };
-  setSpeedButtons(20);
-  setUniformMode(uniformModeEnabled);
-  document.getElementById('scrubber').max = maxMs;
-  document.getElementById('scrubber').value = 0;
-  renderHolidayFrame(0);
-  document.getElementById('playToggle').textContent = '\u25B6';
+  playState = { playing: false, speed: 1, rafId: null, simTime: 0, lastFrameReal: 0, maxMs, renderFn: renderHolidayFrame };
+  setSpeedButtons(1);
   await loadPhotoPins(tripList.map((t) => t.id), allPhotos);
+  playState.chapters = buildChapters();
+  assignStoryPacing(playState.chapters);
+  buildScrubber();
+  queuePlaceLookups();
+  overviewAvailable = true; // a holiday always has a story worth an overview
+  enterOverview();
 }
 
 function legAtSimTime(simTime) {
@@ -843,8 +1386,10 @@ function renderHolidayFrame(simTime) {
     banner.textContent = nextLeg ? `Traveling to ${nextLeg.name}\u2026` : 'Holiday complete';
   }
   banner.classList.add('active');
-  updateStayPulse(ev);
   playMarker.setLatLng([pos.lat, pos.lng]);
+  const arcTip = updateTravelArc(simTime);
+  if (arcTip) playMarker.setLatLng(arcTip);
+  updateStayPulse(travelArc ? null : ev);
 
   let completedDist = 0;
   for (const l of currentHoliday.legs) {
@@ -852,7 +1397,7 @@ function renderHolidayFrame(simTime) {
   }
   const totalDist = completedDist + partialDist;
 
-  document.getElementById('scrubber').value = simTime;
+  updateScrubberValue(simTime);
   document.getElementById('readoutClock').textContent = fmtClock(pos.realTs ?? pos.ts);
   document.getElementById('readoutDist').textContent = fmtDistance(totalDist);
   document.getElementById('readoutSpeed').textContent = ev || !leg ? '\u2014' : fmtSpeed(computeSpeedKmh(leg.points, pos.realTs ?? pos.ts));
@@ -885,6 +1430,7 @@ function playbackTick(nowReal) {
     playState.simTime = playState.maxMs;
     playState.renderFn(playState.simTime);
     pausePlayback();
+    showSummary();
     return;
   }
   playState.renderFn(playState.simTime);
@@ -895,6 +1441,7 @@ function startPlayback() {
   playState.playing = true;
   followEnabled = true;
   document.getElementById('playToggle').textContent = '\u23F8';
+  preloadNextPhoto(playState.simTime);
   playState.lastFrameReal = performance.now();
   playState.rafId = requestAnimationFrame(playbackTick);
 }
@@ -906,13 +1453,6 @@ function pausePlayback() {
 function setSpeedButtons(speed) {
   playState.speed = speed;
   document.querySelectorAll('.speed-btn[data-speed]').forEach((b) => b.classList.toggle('active', Number(b.dataset.speed) === speed));
-}
-
-function setUniformMode(on) {
-  uniformModeEnabled = on;
-  document.getElementById('uniformSpeedBtn').classList.toggle('active', on);
-  if (on) document.querySelectorAll('.speed-btn[data-speed]').forEach((b) => b.classList.remove('active'));
-  else setSpeedButtons(playState.speed);
 }
 
 function updatePaceBadge(simTime) {
@@ -944,6 +1484,7 @@ function photoSimTime(photo) {
 async function loadPhotoPins(tripIds, preloaded) {
   photoMarkers.forEach((m) => playbackMap.removeLayer(m));
   photoMarkers = [];
+  photoEntries.forEach((e) => URL.revokeObjectURL(e.url)); // blobs re-read below; free the old URLs
   photoEntries = [];
   const all = preloaded || (await dbGetAllStore('photos'));
   const mine = all.filter((p) => tripIds.includes(p.tripId));
@@ -972,8 +1513,12 @@ async function loadPhotoPins(tripIds, preloaded) {
 }
 
 /* ---- photo memory card: when playback reaches a photo's moment, glide to a stop and show it
- * big with its date/time, Google Photos memory style, then resume automatically ---- */
-const MEMORY_HOLD_MS = 2600;
+ * big with its date/time, Google Photos memory style, then resume automatically. Photos taken
+ * around the same moment share one hold and cycle as a stack instead of stop-starting playback
+ * once per photo. ---- */
+const MEMORY_HOLD_MS = 2600; // a single photo
+const MEMORY_GROUP_HOLD_MS = 1900; // per photo while cycling a stack
+const MEMORY_GROUP_SPAN_MS = 90000; // synth window binding photos into one held moment
 
 function nextUnshownPhotoBetween(fromSim, toSim) {
   let best = null;
@@ -1001,20 +1546,65 @@ function photoCaption(photo) {
   return caption;
 }
 
-function showPhotoMemory(entry) {
-  memoryActive = entry;
-  memoryShownIds.add(entry.photo.id);
-  document.getElementById('photoMemoryImg').src = entry.url;
+function collectMemoryGroup(entry) {
+  return photoEntries
+    .filter((e) => e.synth != null && !memoryShownIds.has(e.photo.id) && Math.abs(e.synth - entry.synth) <= MEMORY_GROUP_SPAN_MS)
+    .sort((a, b) => a.synth - b.synth);
+}
+
+function preloadNextPhoto(afterSynth) {
+  let next = null;
+  for (const e of photoEntries) {
+    if (e.synth != null && e.synth > afterSynth && (!next || e.synth < next.synth)) next = e;
+  }
+  if (next) new Image().src = next.url; // decode before its card fades in
+}
+
+function renderMemoryPhoto() {
+  const { group, index } = memoryActive;
+  const entry = group[index];
+  const img = document.getElementById('photoMemoryImg');
+  img.src = entry.url;
+  img.classList.remove('kenburns');
+  void img.offsetWidth; // restart the drift for each photo
+  img.classList.add('kenburns');
   document.getElementById('photoMemoryCaption').textContent = photoCaption(entry.photo);
+  const dots = document.getElementById('photoMemoryDots');
+  dots.innerHTML = group.length > 1 ? group.map((_, i) => `<span class="${i === index ? 'on' : ''}"></span>`).join('') : '';
+  preloadNextPhoto(entry.synth);
+}
+
+function showPhotoMemory(entry) {
+  const group = collectMemoryGroup(entry);
+  if (group.length === 0) return;
+  memoryActive = { group, index: 0 };
+  group.forEach((e) => memoryShownIds.add(e.photo.id));
+  renderMemoryPhoto();
   document.getElementById('photoMemory').classList.add('active');
   playState.holding = true;
+  scheduleMemoryStep();
+}
+
+function scheduleMemoryStep() {
+  const hold = memoryActive.group.length > 1 ? MEMORY_GROUP_HOLD_MS : MEMORY_HOLD_MS;
   memoryTimer = setTimeout(() => {
+    memoryTimer = null;
+    if (!memoryActive) return;
+    if (memoryActive.index < memoryActive.group.length - 1) {
+      memoryActive.index++;
+      const entry = memoryActive.group[memoryActive.index];
+      playState.simTime = Math.max(0, Math.min(entry.synth, playState.maxMs)); // marker hops along with the stack
+      playState.renderFn(playState.simTime);
+      renderMemoryPhoto();
+      scheduleMemoryStep();
+      return;
+    }
     dismissPhotoMemory();
     if (playState.playing) {
       playState.lastFrameReal = performance.now();
       playState.rafId = requestAnimationFrame(playbackTick);
     }
-  }, MEMORY_HOLD_MS);
+  }, hold);
 }
 
 function dismissPhotoMemory() {
@@ -1147,15 +1737,11 @@ function interpolateByRealTs(points, targetTs) {
   if (targetTs <= key(points[0])) return points[0];
   const last = points[points.length - 1];
   if (targetTs >= key(last)) return last;
-  for (let i = 0; i < points.length - 1; i++) {
-    const a = points[i], b = points[i + 1];
-    if (key(a) <= targetTs && key(b) >= targetTs) {
-      const span = key(b) - key(a) || 1;
-      const f = (targetTs - key(a)) / span;
-      return { lat: a.lat + (b.lat - a.lat) * f, lng: a.lng + (b.lng - a.lng) * f };
-    }
-  }
-  return last;
+  const i = lowerBoundIdx(points, targetTs, key);
+  const a = points[i], b = points[i + 1];
+  const span = key(b) - key(a) || 1;
+  const f = (targetTs - key(a)) / span;
+  return { lat: a.lat + (b.lat - a.lat) * f, lng: a.lng + (b.lng - a.lng) * f };
 }
 
 async function resolvePhotoAnchor(file) {
@@ -1557,10 +2143,34 @@ window.addEventListener('DOMContentLoaded', () => {
   });
 
   document.getElementById('playbackBackBtn').addEventListener('click', () => {
+    if (playbackMode === 'playing' && overviewAvailable) {
+      enterOverview();
+      return;
+    }
     pausePlayback();
+    dismissPhotoMemory();
+    hideSummary();
+    if (playbackMap) playbackMap.stop(); // kill any in-flight camera animation before the view goes away
+    photoEntries.forEach((e) => URL.revokeObjectURL(e.url));
+    photoEntries = [];
     currentHoliday = null;
     showView('home');
     renderHome();
+  });
+
+  document.getElementById('overviewPlayBtn').addEventListener('click', () => enterPlaying(0, true));
+  document.getElementById('storylineStrip').addEventListener('scroll', () => requestAnimationFrame(highlightCenteredChapter));
+  document.getElementById('momentCloseBtn').addEventListener('click', closeMomentSheet);
+  document.getElementById('summaryReplayBtn').addEventListener('click', () => {
+    hideSummary();
+    enterPlaying(0, true);
+  });
+  document.getElementById('summaryOverviewBtn').addEventListener('click', () => {
+    hideSummary();
+    enterOverview();
+  });
+  document.getElementById('summaryOverlay').addEventListener('click', (e) => {
+    if (e.target === e.currentTarget) hideSummary();
   });
 
   document.getElementById('playToggle').addEventListener('click', () => {
@@ -1568,26 +2178,37 @@ window.addEventListener('DOMContentLoaded', () => {
     else { playState.lastFrameReal = performance.now(); startPlayback(); }
   });
 
-  document.getElementById('scrubber').addEventListener('input', (e) => {
+  const scrubEl = document.getElementById('storyScrubber');
+  let scrubbing = false;
+  const doScrub = (e) => {
     pausePlayback();
     dismissPhotoMemory();
     followEnabled = true;
-    playState.simTime = Number(e.target.value);
+    playState.simTime = Math.max(0, Math.min(simFromScrubberX(e.clientX), playState.maxMs));
     rearmMemoriesAfter(playState.simTime);
     playState.renderFn(playState.simTime);
+  };
+  scrubEl.addEventListener('pointerdown', (e) => {
+    scrubbing = true;
+    scrubEl.setPointerCapture(e.pointerId);
+    doScrub(e);
   });
+  scrubEl.addEventListener('pointermove', (e) => { if (scrubbing) doScrub(e); });
+  scrubEl.addEventListener('pointerup', () => { scrubbing = false; });
 
   document.getElementById('photoMemory').addEventListener('click', () => {
-    const entry = memoryActive;
+    const active = memoryActive;
     dismissPhotoMemory();
     pausePlayback();
-    if (entry) openPhotoLightbox(entry.photo, entry.url);
+    if (active) {
+      const entry = active.group[active.index];
+      openPhotoLightbox(entry.photo, entry.url);
+    }
   });
 
   document.querySelectorAll('.speed-btn[data-speed]').forEach((b) => {
-    b.addEventListener('click', () => { setSpeedButtons(Number(b.dataset.speed)); setUniformMode(false); });
+    b.addEventListener('click', () => setSpeedButtons(Number(b.dataset.speed)));
   });
-  document.getElementById('uniformSpeedBtn').addEventListener('click', () => setUniformMode(!uniformModeEnabled));
 
   document.getElementById('deleteTripBtn').addEventListener('click', async () => {
     if (currentHoliday) {
@@ -1699,8 +2320,10 @@ window.addEventListener('DOMContentLoaded', () => {
     if (lightboxPhoto && confirm('Delete this photo?')) {
       await dbDeleteStore('photos', lightboxPhoto.id);
       document.getElementById('photoLightbox').classList.remove('active');
+      closeMomentSheet();
       const ids = currentHoliday ? currentHoliday.legs.map((l) => l.tripId) : [currentPlayTrip.id];
       await loadPhotoPins(ids);
+      if (playbackMode === 'overview') enterOverview(); // re-cluster moments and refresh the strip
     }
   });
 

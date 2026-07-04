@@ -190,10 +190,56 @@ html, body {
 .pace-badge.slow { color: var(--amber); }
 .pace-badge.fast { color: var(--teal); }
 
-.scrubber {
-  width: 100%;
-  accent-color: var(--amber);
-  margin-bottom: 12px;
+.story-scrubber {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  height: 24px;
+  margin-bottom: 10px;
+  cursor: pointer;
+  touch-action: none;
+}
+.scrub-seg {
+  position: relative;
+  flex-grow: 1;
+  flex-basis: 0;
+  height: 6px;
+  border-radius: 4px;
+  background: var(--navy-2);
+  border: 1px solid var(--line);
+}
+.scrub-seg.gap {
+  flex: 0 0 10px;
+  height: 2px;
+  background: none;
+  border: none;
+  border-top: 2px dotted var(--teal);
+  border-radius: 0;
+}
+.scrub-fill {
+  position: absolute;
+  left: 0; top: 0; bottom: 0;
+  width: 0;
+  background: var(--amber);
+  border-radius: 4px;
+}
+.scrub-seg.gap .scrub-fill { background: none; }
+.scrub-dot {
+  position: absolute;
+  top: -5px;
+  width: 7px; height: 7px;
+  margin-left: -3.5px;
+  border-radius: 50%;
+  background: var(--paper);
+  border: 1.5px solid var(--amber);
+}
+.scrub-tick {
+  position: absolute;
+  top: -4px;
+  width: 2px; height: 12px;
+  margin-left: -1px;
+  background: var(--teal);
+  border-radius: 1px;
 }
 
 .playback-buttons { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
@@ -226,9 +272,6 @@ html, body {
   cursor: pointer;
 }
 .speed-btn.active { border-color: var(--amber); color: var(--amber); }
-
-.uniform-btn { flex-shrink: 0; }
-.uniform-btn.active { border-color: var(--teal); color: var(--teal); }
 
 /* ---------- Naming modal ---------- */
 .modal-backdrop {
@@ -429,6 +472,135 @@ html, body {
   box-shadow: 0 2px 8px rgba(0,0,0,0.4);
 }
 
+/* ---------- overview (atlas) panel ---------- */
+.overview-header {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  margin-bottom: 12px;
+}
+.overview-stats {
+  font-family: var(--font-data);
+  font-size: 13px;
+  color: var(--amber);
+}
+
+.storyline-strip {
+  display: flex;
+  gap: 10px;
+  overflow-x: auto;
+  scroll-snap-type: x proximity;
+  padding-bottom: 4px;
+  -webkit-overflow-scrolling: touch;
+  scrollbar-width: none;
+}
+.storyline-strip::-webkit-scrollbar { display: none; }
+
+.chapter-card {
+  flex: 0 0 150px;
+  scroll-snap-align: center;
+  background: var(--navy-2);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 10px 12px;
+  cursor: pointer;
+}
+.chapter-card.active { border-color: var(--amber); }
+.chapter-card .chapter-title {
+  font-size: 13px;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  margin-bottom: 3px;
+}
+.chapter-card .chapter-meta {
+  font-family: var(--font-data);
+  font-size: 10.5px;
+  color: var(--amber);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  margin-bottom: 7px;
+}
+.chapter-card .chapter-thumbs {
+  display: flex;
+  gap: 4px;
+}
+.chapter-card .chapter-thumbs div {
+  width: 38px; height: 38px;
+  border-radius: 7px;
+  background-size: cover;
+  background-position: center;
+  border: 1px solid var(--line);
+}
+
+/* ---------- photo moment pins (overview) ---------- */
+.moment-pin {
+  width: 46px; height: 46px;
+  border-radius: 12px;
+  border: 2.5px solid var(--paper);
+  background-size: cover;
+  background-position: center;
+  box-shadow: 0 4px 14px rgba(0,0,0,0.5);
+  position: relative;
+}
+.moment-count {
+  position: absolute;
+  top: -7px; right: -7px;
+  background: var(--amber);
+  color: var(--navy);
+  font-family: var(--font-data);
+  font-size: 10.5px;
+  font-weight: 700;
+  min-width: 18px;
+  height: 18px;
+  line-height: 18px;
+  text-align: center;
+  border-radius: 999px;
+  padding: 0 3px;
+}
+
+.moment-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 8px;
+  margin-bottom: 14px;
+  max-height: 40vh;
+  overflow-y: auto;
+}
+.moment-cell {
+  aspect-ratio: 1;
+  border-radius: 10px;
+  background-size: cover;
+  background-position: center;
+  border: 1px solid var(--line);
+  cursor: pointer;
+}
+.moment-cell:active { border-color: var(--amber); }
+
+/* ---------- end-of-story summary ---------- */
+.summary-overlay { align-items: center; padding: 0 24px; }
+.summary-sheet {
+  border-radius: 20px;
+  text-align: center;
+  max-width: 340px;
+  margin: 0 auto;
+}
+.summary-glyph { font-size: 34px; color: var(--amber); margin-bottom: 8px; }
+.summary-route {
+  font-size: 14px;
+  color: var(--paper-dim);
+  margin-bottom: 6px;
+}
+.summary-route:empty { display: none; }
+.summary-stats {
+  font-family: var(--font-data);
+  font-size: 13px;
+  color: var(--amber);
+  margin-bottom: 18px;
+}
+
 /* ---------- photo memory card ---------- */
 .photo-memory {
   position: absolute;
@@ -452,14 +624,37 @@ html, body {
   pointer-events: auto;
   transform: translate(-50%, -50%) scale(1);
 }
+.photo-memory-frame {
+  overflow: hidden;
+  border-radius: 10px;
+}
 .photo-memory img {
   width: 100%;
   max-height: 38vh;
   object-fit: cover;
-  border-radius: 10px;
   background: var(--navy);
   display: block;
 }
+.photo-memory img.kenburns {
+  animation: kenburns 7s ease-out both;
+}
+@keyframes kenburns {
+  from { transform: scale(1); }
+  to { transform: scale(1.07) translate(-1.5%, -1%); }
+}
+.photo-memory-dots {
+  display: flex;
+  justify-content: center;
+  gap: 5px;
+  margin-top: 9px;
+}
+.photo-memory-dots:empty { display: none; }
+.photo-memory-dots span {
+  width: 6px; height: 6px;
+  border-radius: 50%;
+  background: var(--line);
+}
+.photo-memory-dots span.on { background: var(--amber); }
 .photo-memory-caption {
   font-family: var(--font-data);
   font-size: 12.5px;
