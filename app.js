@@ -373,7 +373,7 @@ async function stopRecording() {
 }
 
 /* ================= PLAYBACK (shared: single trip + holiday) ================= */
-let playbackMap, ghostLayers, activeLine, playMarker, currentPlayTrip, currentHoliday;
+let playbackMap, ghostLayers, activeLine, tipLine, playMarker, currentPlayTrip, currentHoliday;
 let photoMarkers = [];
 let photoEntries = [];
 let stayPulseMarker = null;
@@ -387,7 +387,10 @@ let momentLayer = null;
 let chapterLines = [];
 let activeChapterIdx = -1;
 let followEnabled = false;
-let autoZoomCurrent = null;
+let cam = null; // damped camera state { lat, lng, zoom, lastFrame }
+let followZoomTarget = null;
+let traceState = { key: null, idx: -1, dist: 0 };
+let lastHudAt = 0;
 let playState = { playing: false, speed: 1, rafId: null, simTime: 0, lastFrameReal: 0, maxMs: 0, renderFn: null };
 
 /* binary search: the interpolators below run per animation frame on merged trips that can carry
@@ -631,16 +634,21 @@ function buildPaceProfile(points, photosForTrip, simOffset) {
   }
 
   const dips = [];
+  let lastTurnSim = -Infinity;
   for (let i = 1; i < n - 1; i++) {
-    // bearing across a near-zero-distance segment is just GPS noise, not a real heading —
-    // require real displacement on both sides before trusting the bearing comparison
-    if (segDist[i] < 3 || segDist[i + 1] < 3) continue;
+    // bearing across a short segment is mostly GPS noise, not a real heading — require
+    // solid displacement on both sides, a decisive angle, and spacing between dips,
+    // otherwise real 1s-cadence GPS generates near-continuous dips and playback wobbles throughout
+    if (segDist[i] < 8 || segDist[i + 1] < 8) continue;
     const b1 = bearing(points[i - 1], points[i]);
     const b2 = bearing(points[i], points[i + 1]);
     let diff = Math.abs(b2 - b1) % 360;
     if (diff > 180) diff = 360 - diff;
-    if (diff > 20) {
-      dips.push({ sim: points[i].ts - simOffset, strength: Math.min(1, diff / 90) * 0.3, radius: TURN_RADIUS_MS });
+    if (diff > 35) {
+      const sim = points[i].ts - simOffset;
+      if (sim - lastTurnSim < 15000) continue;
+      lastTurnSim = sim;
+      dips.push({ sim, strength: Math.min(1, diff / 90) * 0.3, radius: TURN_RADIUS_MS });
     }
   }
   for (const photo of photosForTrip) {
@@ -728,6 +736,8 @@ function setupPlaybackMap(legsForGhost) {
   L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
     attribution: '&copy; OpenStreetMap',
     maxZoom: 19,
+    updateWhenZooming: false, // don't flush tiles mid-glide
+    keepBuffer: 4,
   }).addTo(playbackMap);
 
   ghostLayers = L.layerGroup().addTo(playbackMap);
@@ -739,6 +749,7 @@ function setupPlaybackMap(legsForGhost) {
     allBounds = allBounds ? allBounds.extend(line.getBounds()) : line.getBounds();
   });
   activeLine = L.polyline([], { color: '#E8934A', weight: 4 }).addTo(playbackMap);
+  tipLine = L.polyline([], { color: '#E8934A', weight: 4 }).addTo(playbackMap);
   const firstPt = legsForGhost[0].points[0];
   playMarker = L.circleMarker([firstPt.lat, firstPt.lng], { radius: 7, color: '#F0EAD8', fillColor: '#E8934A', fillOpacity: 1, weight: 2 }).addTo(playbackMap);
   if (allBounds) playbackMap.fitBounds(allBounds, { padding: [30, 30] });
@@ -750,7 +761,9 @@ function setupPlaybackMap(legsForGhost) {
   chapterLines = [];
   activeChapterIdx = -1;
   followEnabled = false;
-  autoZoomCurrent = null;
+  cam = null;
+  followZoomTarget = null;
+  resetTrace();
 }
 
 function updateStayPulse(ev) {
@@ -814,17 +827,23 @@ function updateTravelArc(simTime) {
     if (travelArc) {
       playbackMap.removeLayer(travelArc.line);
       travelArc = null;
-      autoZoomCurrent = null; // reseed the follow camera after the wide shot
+      followZoomTarget = null; // re-aim fresh; the damped camera glides back in, no cut
       if (playState.playing) followEnabled = true;
     }
     return null;
   }
   if (!travelArc || travelArc.key !== big.key) {
     if (travelArc) playbackMap.removeLayer(travelArc.line);
-    travelArc = { key: big.key, line: L.polyline([], { color: '#E8934A', weight: 3, dashArray: '6,9', opacity: 0.9 }).addTo(playbackMap) };
+    const bounds = L.latLngBounds([big.from.lat, big.from.lng], [big.to.lat, big.to.lng]).pad(0.35);
+    travelArc = {
+      key: big.key,
+      line: L.polyline([], { color: '#E8934A', weight: 3, dashArray: '6,9', opacity: 0.9 }).addTo(playbackMap),
+      center: bounds.getCenter(),
+      zoom: playbackMap.getBoundsZoom(bounds),
+    };
     followEnabled = false;
-    playbackMap.flyToBounds(L.latLngBounds([big.from.lat, big.from.lng], [big.to.lat, big.to.lng]).pad(0.35), { duration: 0.9 });
   }
+  camUpdate(travelArc.center.lat, travelArc.center.lng, travelArc.zoom, CAM_TAU_ARC, CAM_TAU_ARC);
   const f = Math.max(0, Math.min(1, (simTime - big.start) / Math.max(1, big.end - big.start)));
   const pts = arcLatLngs(big.from, big.to, f);
   travelArc.line.setLatLngs(pts);
@@ -1079,7 +1098,8 @@ function enterPlaying(simTime, autoplay) {
   playState.simTime = Math.max(0, Math.min(simTime, playState.maxMs));
   if (playState.simTime === 0) memoryShownIds.clear();
   else rearmMemoriesAfter(playState.simTime);
-  autoZoomCurrent = null;
+  camSeedFromMap(); // the damped camera glides from wherever the view is now, never cuts
+  resetTrace();
   playState.renderFn(playState.simTime);
   if (autoplay) startPlayback();
   else document.getElementById('playToggle').textContent = '▶';
@@ -1188,8 +1208,37 @@ function hideSummary() {
 /* ---- auto-follow camera: zoom based on how much ground is covered in the next few seconds,
  * so a fast leg (flight/highway) doesn't fly off-screen and a slow one isn't zoomed out to nothing ---- */
 const FOLLOW_LOOKAHEAD_MS = 30000;
-const FOLLOW_ZOOM_SMOOTHING = 0.025;
-const FOLLOW_MAX_ZOOM_STEP = 0.05;
+const FOLLOW_ZOOM_HYSTERESIS = 0.8;
+const CAM_TAU_POS = 600;
+const CAM_TAU_ZOOM = 1500;
+const CAM_TAU_ARC = 1100;
+
+function camSeedFromMap() {
+  const c = playbackMap.getCenter();
+  cam = { lat: c.lat, lng: c.lng, zoom: playbackMap.getZoom(), lastFrame: performance.now() };
+  followZoomTarget = null;
+}
+
+/* One continuous damped camera: every frame it eases toward its target (position and zoom)
+ * with dt-aware exponential smoothing, so nothing (GPS jitter, pace steps, arc entry/exit)
+ * can ever jump the view. */
+function camUpdate(tLat, tLng, tZoom, tauPos, tauZoom) {
+  if (!cam) camSeedFromMap();
+  const now = performance.now();
+  const dt = Math.min(100, Math.max(0, now - cam.lastFrame));
+  cam.lastFrame = now;
+  const aP = 1 - Math.exp(-dt / tauPos);
+  const aZ = 1 - Math.exp(-dt / tauZoom);
+  cam.lat += (tLat - cam.lat) * aP;
+  cam.lng += (tLng - cam.lng) * aP;
+  cam.zoom += (tZoom - cam.zoom) * aZ;
+  // dead-band: hold the map perfectly still through GPS jitter and stays
+  const movedPx = playbackMap
+    .latLngToContainerPoint([cam.lat, cam.lng])
+    .distanceTo(playbackMap.latLngToContainerPoint(playbackMap.getCenter()));
+  if (movedPx < 0.5 && Math.abs(cam.zoom - playbackMap.getZoom()) < 0.02) return;
+  playbackMap.setView([cam.lat, cam.lng], cam.zoom, { animate: false });
+}
 
 function computeTargetZoom(pos, aheadPos) {
   const spanMeters = Math.max(30, haversine(pos, aheadPos));
@@ -1198,18 +1247,17 @@ function computeTargetZoom(pos, aheadPos) {
   const metersPerPixel = spanMeters / (minDim * 0.22);
   const latRad = (pos.lat * Math.PI) / 180;
   const zoom = Math.log2((156543.03392 * Math.cos(latRad)) / metersPerPixel);
-  return Math.min(17, Math.max(4, zoom));
+  return Math.min(16, Math.max(4, zoom)); // 17 loads too sparsely at playback speed
 }
 
-function updateAutoFollow(pos, aheadPos) {
-  const target = computeTargetZoom(pos, aheadPos);
-  if (autoZoomCurrent == null) {
-    autoZoomCurrent = target;
-  } else {
-    const step = (target - autoZoomCurrent) * FOLLOW_ZOOM_SMOOTHING;
-    autoZoomCurrent += Math.max(-FOLLOW_MAX_ZOOM_STEP, Math.min(FOLLOW_MAX_ZOOM_STEP, step));
+/* zoom targets are hysteretic: they only re-aim when the desired zoom moves substantially,
+ * so tiles aren't rescaled frame after frame (the "trippy" shimmer) */
+function updateAutoFollow(pos, aheadPos, freezeZoom) {
+  if (!freezeZoom || followZoomTarget == null) {
+    const desired = computeTargetZoom(pos, aheadPos);
+    if (followZoomTarget == null || Math.abs(desired - followZoomTarget) > FOLLOW_ZOOM_HYSTERESIS) followZoomTarget = desired;
   }
-  playbackMap.setView([pos.lat, pos.lng], autoZoomCurrent);
+  camUpdate(pos.lat, pos.lng, followZoomTarget, CAM_TAU_POS, CAM_TAU_ZOOM);
 }
 
 /* ---- single trip playback ---- */
@@ -1246,39 +1294,72 @@ async function openPlayback(id) {
   else enterPlaying(0, false);
 }
 
+/* ---- calm frames: text/layout work is throttled, the traced line grows incrementally ---- */
+function setTextIfChanged(id, txt) {
+  const el = document.getElementById(id);
+  if (el.textContent !== txt) el.textContent = txt;
+}
+function hudShouldUpdate() {
+  const now = performance.now();
+  if (playState.playing && now - lastHudAt < 200) return false;
+  lastHudAt = now;
+  return true;
+}
+
+function resetTrace() {
+  traceState = { key: null, idx: -1, dist: 0 };
+}
+/* committed points append one by one; only the 2-point tip moves per frame. Rebuilds happen
+ * only on seeks and leg changes, so long merged trips stop re-allocating thousands of latlngs
+ * sixty times a second. Returns the distance traced so far. */
+function updateTrace(pts, idx, pos, key) {
+  if (traceState.key !== key || idx < traceState.idx || idx - traceState.idx > 50) {
+    const slice = pts.slice(0, idx + 1);
+    activeLine.setLatLngs(slice.map((p) => [p.lat, p.lng]));
+    traceState = { key, idx, dist: pathDistance(slice) };
+  } else {
+    for (let i = traceState.idx + 1; i <= idx; i++) {
+      activeLine.addLatLng([pts[i].lat, pts[i].lng]);
+      traceState.dist += haversine(pts[i - 1], pts[i]);
+    }
+    traceState.idx = idx;
+  }
+  tipLine.setLatLngs([[pts[idx].lat, pts[idx].lng], [pos.lat, pos.lng]]);
+  return traceState.dist + haversine(pts[idx], pos);
+}
+
 function renderFrame(simTime) {
   const pts = playState.displayPoints;
   const { idx, pos } = pointAtSimTime(pts, simTime);
-  const traced = pts.slice(0, idx + 1).map((p) => [p.lat, p.lng]);
-  traced.push([pos.lat, pos.lng]);
-  activeLine.setLatLngs(traced);
+  const dist = updateTrace(pts, idx, pos, 'trip');
   playMarker.setLatLng([pos.lat, pos.lng]);
 
-  let dist = 0;
-  for (let i = 1; i < traced.length; i++) {
-    dist += haversine({ lat: traced[i - 1][0], lng: traced[i - 1][1] }, { lat: traced[i][0], lng: traced[i][1] });
-  }
-
   const ev = eventAtSimTime(simTime);
-  const banner = document.getElementById('legBanner');
-  if (ev) {
-    banner.textContent = stayLabel(ev);
-    banner.classList.add('active');
-  } else {
-    banner.classList.remove('active');
-  }
   const arcTip = updateTravelArc(simTime);
   if (arcTip) playMarker.setLatLng(arcTip);
   updateStayPulse(travelArc ? null : ev);
-
   updateScrubberValue(simTime);
-  document.getElementById('readoutClock').textContent = fmtClock(pos.realTs ?? pos.ts);
-  document.getElementById('readoutDist').textContent = fmtDistance(dist);
-  document.getElementById('readoutSpeed').textContent = ev ? '\u2014' : fmtSpeed(computeSpeedKmh(pts, pos.realTs ?? pos.ts));
-  updatePaceBadge(simTime);
-  if (followEnabled) {
+
+  if (hudShouldUpdate()) {
+    const banner = document.getElementById('legBanner');
+    if (ev) {
+      setTextIfChanged('legBanner', stayLabel(ev));
+      banner.classList.add('active');
+    } else {
+      banner.classList.remove('active');
+    }
+    setTextIfChanged('readoutClock', fmtClock(pos.realTs ?? pos.ts));
+    setTextIfChanged('readoutDist', fmtDistance(dist));
+    setTextIfChanged('readoutSpeed', ev ? '—' : fmtSpeed(computeSpeedKmh(pts, pos.realTs ?? pos.ts)));
+    updatePaceBadge(simTime);
+  }
+
+  if (followEnabled && !travelArc) {
     const aheadPos = pointAtSimTime(pts, Math.min(simTime + FOLLOW_LOOKAHEAD_MS, playState.maxMs)).pos;
-    updateAutoFollow(pos, aheadPos);
+    // during a stay the marker wobbles through the compressed GPS cluster and the lookahead
+    // sweeps wildly across it — anchor the camera on the event's location and freeze the zoom
+    // target so the map holds perfectly still instead of chasing jitter
+    updateAutoFollow(ev ? { lat: ev.lat, lng: ev.lng } : pos, aheadPos, !!ev);
   }
 }
 
@@ -1366,57 +1447,59 @@ function legAtSimTime(simTime) {
 }
 
 function renderHolidayFrame(simTime) {
-  const banner = document.getElementById('legBanner');
   const leg = legAtSimTime(simTime);
   const ev = eventAtSimTime(simTime);
-  let pos, partialDist = 0;
+  let pos, partialDist = 0, bannerText, aheadPos;
 
   if (leg) {
     const local = pointAtSimTime(leg.points, simTime - leg.synthStart);
     pos = local.pos;
-    const traced = leg.points.slice(0, local.idx + 1);
-    activeLine.setLatLngs(traced.concat([pos]).map((p) => [p.lat, p.lng]));
-    partialDist = pathDistance(traced.concat([pos]));
-    banner.textContent = ev ? stayLabel(ev) : `${leg.name} \u00b7 ${fmtDate(leg.realStart)}`;
+    partialDist = updateTrace(leg.points, local.idx, pos, leg.tripId);
+    bannerText = ev ? stayLabel(ev) : `${leg.name} · ${fmtDate(leg.realStart)}`;
+    aheadPos = pointAtSimTime(leg.points, Math.min(simTime + FOLLOW_LOOKAHEAD_MS, leg.synthEnd) - leg.synthStart).pos;
   } else {
     const prevLeg = [...currentHoliday.legs].reverse().find((l) => l.synthEnd <= simTime);
     const nextLeg = currentHoliday.legs.find((l) => l.synthStart > simTime);
     pos = prevLeg ? prevLeg.points[prevLeg.points.length - 1] : currentHoliday.legs[0].points[0];
     activeLine.setLatLngs([]);
-    banner.textContent = nextLeg ? `Traveling to ${nextLeg.name}\u2026` : 'Holiday complete';
+    tipLine.setLatLngs([]);
+    resetTrace();
+    bannerText = nextLeg ? `Traveling to ${nextLeg.name}…` : 'Holiday complete';
+    aheadPos = pos;
   }
-  banner.classList.add('active');
   playMarker.setLatLng([pos.lat, pos.lng]);
   const arcTip = updateTravelArc(simTime);
   if (arcTip) playMarker.setLatLng(arcTip);
   updateStayPulse(travelArc ? null : ev);
-
-  let completedDist = 0;
-  for (const l of currentHoliday.legs) {
-    if (l.synthEnd <= simTime && l !== leg) completedDist += l.distance;
-  }
-  const totalDist = completedDist + partialDist;
-
   updateScrubberValue(simTime);
-  document.getElementById('readoutClock').textContent = fmtClock(pos.realTs ?? pos.ts);
-  document.getElementById('readoutDist').textContent = fmtDistance(totalDist);
-  document.getElementById('readoutSpeed').textContent = ev || !leg ? '\u2014' : fmtSpeed(computeSpeedKmh(leg.points, pos.realTs ?? pos.ts));
-  updatePaceBadge(simTime);
-  if (followEnabled) {
-    let aheadPos = pos;
-    if (leg) aheadPos = pointAtSimTime(leg.points, Math.min(simTime + FOLLOW_LOOKAHEAD_MS, leg.synthEnd) - leg.synthStart).pos;
-    updateAutoFollow(pos, aheadPos);
+
+  if (hudShouldUpdate()) {
+    let completedDist = 0;
+    for (const l of currentHoliday.legs) {
+      if (l.synthEnd <= simTime && l !== leg) completedDist += l.distance;
+    }
+    setTextIfChanged('legBanner', bannerText);
+    document.getElementById('legBanner').classList.add('active');
+    setTextIfChanged('readoutClock', fmtClock(pos.realTs ?? pos.ts));
+    setTextIfChanged('readoutDist', fmtDistance(completedDist + partialDist));
+    setTextIfChanged('readoutSpeed', ev || !leg ? '—' : fmtSpeed(computeSpeedKmh(leg.points, pos.realTs ?? pos.ts)));
+    updatePaceBadge(simTime);
   }
+
+  if (followEnabled && !travelArc) updateAutoFollow(ev ? { lat: ev.lat, lng: ev.lng } : pos, aheadPos, !!ev);
 }
 
 /* ---- shared playback controls ---- */
 function playbackTick(nowReal) {
   if (!playState.playing || playState.holding) return;
-  const dtReal = nowReal - playState.lastFrameReal;
+  const dtReal = Math.min(100, Math.max(0, nowReal - playState.lastFrameReal));
   playState.lastFrameReal = nowReal;
-  const pace = currentPaceMultiplier(playState.simTime);
-  const base = currentBaseSpeed(playState.simTime);
-  const nextSim = playState.simTime + dtReal * base * pace;
+  // smooth the rate itself: chapter/gap speed steps, pace dips, and hold-resumes all become
+  // glides instead of velocity jumps
+  const targetRate = currentBaseSpeed(playState.simTime) * currentPaceMultiplier(playState.simTime);
+  const prevRate = playState.rate != null ? playState.rate : targetRate;
+  playState.rate = prevRate + (targetRate - prevRate) * (1 - Math.exp(-dtReal / 350));
+  const nextSim = playState.simTime + dtReal * playState.rate;
   const photoHit = nextUnshownPhotoBetween(playState.simTime, nextSim);
   if (photoHit) {
     // land exactly on the photo's moment and hold there while the memory card shows
@@ -1438,6 +1521,7 @@ function playbackTick(nowReal) {
 }
 function startPlayback() {
   if (playState.holding) dismissPhotoMemory();
+  playState.rate = 0; // ease in from standstill
   playState.playing = true;
   followEnabled = true;
   document.getElementById('playToggle').textContent = '\u23F8';
@@ -1601,6 +1685,7 @@ function scheduleMemoryStep() {
     }
     dismissPhotoMemory();
     if (playState.playing) {
+      playState.rate = 0; // ease back in after the hold
       playState.lastFrameReal = performance.now();
       playState.rafId = requestAnimationFrame(playbackTick);
     }
