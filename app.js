@@ -374,6 +374,7 @@ async function stopRecording() {
 
 /* ================= PLAYBACK (shared: single trip + holiday) ================= */
 let playbackMap, ghostLayers, activeLine, tipLine, playMarker, currentPlayTrip, currentHoliday;
+let playbackRenderer = null; // the map's shared vector renderer, re-based per frame during zoom glides
 let photoMarkers = [];
 let photoEntries = [];
 let stayPulseMarker = null;
@@ -898,6 +899,7 @@ function setupPlaybackMap(legsForGhost) {
     } catch (e) { /* map already unusable — removing it is all that's left */ }
     playbackMap.remove();
     playbackMap = null;
+    playbackRenderer = null;
   }
   playbackMap = L.map('playbackMap', { zoomControl: false }).setView([20, 0], 3);
   L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
@@ -918,6 +920,7 @@ function setupPlaybackMap(legsForGhost) {
   });
   activeLine = L.polyline([], { color: '#E8934A', weight: 4 }).addTo(playbackMap);
   tipLine = L.polyline([], { color: '#E8934A', weight: 4 }).addTo(playbackMap);
+  playbackRenderer = playbackMap.getRenderer(activeLine); // every playback path shares this renderer
   const firstPt = legsForGhost[0].points[0];
   playMarker = L.circleMarker([firstPt.lat, firstPt.lng], { radius: 7, color: '#0F1B2A', fillColor: '#E8934A', fillOpacity: 1, weight: 2 }).addTo(playbackMap);
   if (allBounds) playbackMap.fitBounds(allBounds, { padding: [30, 30] });
@@ -1447,6 +1450,12 @@ function camUpdate(tLat, tLng, tZoom, tauPos, tauZoom) {
       camGliding = false;
     } else {
       playbackMap._move(L.latLng(cam.lat, cam.lng), cam.zoom, { flyTo: true });
+      // re-base the vector renderer to this exact fractional frame. Left to its own 'zoom'
+      // handler it would CSS-scale its container instead: stroke widths and the dot's radius
+      // balloon/shrink with 2^Δzoom, and paths edited mid-glide (trace, tip, dot) project in
+      // the current frame while the transform still maps the baseline frame — visibly warped.
+      // _reset() re-projects and redraws everything (viewport-clipped) at nominal size.
+      if (playbackRenderer) playbackRenderer._reset();
     }
     return;
   }
