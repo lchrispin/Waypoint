@@ -881,6 +881,13 @@ function currentBaseSpeed(simTime) {
   return (c ? c.storySpeed : STORY_GAP_SPEED) * mult;
 }
 
+/* the rate playback is *aiming* for right now. The eased playState.rate chases this; the
+ * camera's zoom targeting reads this directly, because the eased rate swings through every
+ * ease-in and pace dip and would drag the zoom in and out with it at high speed */
+function plannedRate(simTime) {
+  return currentBaseSpeed(simTime) * currentPaceMultiplier(simTime);
+}
+
 function setupPlaybackMap(legsForGhost) {
   if (playbackMap) {
     // settle any in-flight animated zoom before teardown — removing a map mid-animation
@@ -924,7 +931,8 @@ function setupPlaybackMap(legsForGhost) {
   followEnabled = false;
   cam = null;
   followZoomTarget = null;
-  camZooming = false;
+  zoomEma = null;
+  camGliding = false;
   resetTrace();
 }
 
@@ -1001,6 +1009,7 @@ function updateTravelArc(simTime) {
       playbackMap.removeLayer(travelArc.line);
       travelArc = null;
       followZoomTarget = null; // re-aim fresh; the damped camera glides back in, no cut
+      zoomEma = null;
       if (playState.playing) followEnabled = true;
     }
     return null;
@@ -1015,9 +1024,9 @@ function updateTravelArc(simTime) {
       zoom: Math.round(playbackMap.getBoundsZoom(bounds)),
     };
     followEnabled = false;
-    startZoomGlide(travelArc.zoom, [travelArc.center.lat, travelArc.center.lng], zoomGlideDurMs(playbackMap.getZoom() - travelArc.zoom));
   }
-  camUpdate(travelArc.center.lat, travelArc.center.lng, CAM_TAU_ARC);
+  // the same continuous camera frames the arc: pull out to hold both endpoints on screen
+  camUpdate(travelArc.center.lat, travelArc.center.lng, travelArc.zoom, CAM_TAU_ARC, CAM_TAU_ARC);
   const f = Math.max(0, Math.min(1, (simTime - big.start) / Math.max(1, big.end - big.start)));
   const pts = arcLatLngs(big.from, big.to, f);
   travelArc.line.setLatLngs(pts);
@@ -1241,7 +1250,6 @@ function highlightCenteredChapter() {
 function enterOverview() {
   pausePlayback();
   dismissPhotoMemory();
-  if (playbackMap && camZooming) playbackMap.stop();
   hideSummary();
   playbackMode = 'overview';
   document.getElementById('playerPanel').style.display = 'none';
@@ -1275,8 +1283,10 @@ function enterPlaying(simTime, autoplay) {
   playState.simTime = Math.max(0, Math.min(simTime, playState.maxMs));
   if (playState.simTime === 0) memoryShownIds.clear();
   else rearmMemoriesAfter(playState.simTime);
-  if (camZooming) playbackMap.stop();
+  playbackMap.stop(); // cancel an in-flight overview flight; the per-frame camera takes over from here
   camSeedFromMap(); // the damped camera glides from wherever the view is now, never cuts
+  followZoomTarget = null; // re-aim fresh — the previous framing belongs to another part of the story
+  zoomEma = null;
   resetTrace();
   playState.renderFn(playState.simTime);
   if (autoplay) startPlayback();
@@ -1388,44 +1398,64 @@ function hideSummary() {
 const FOLLOW_REAL_LOOKAHEAD_MS = 2500; // frame the next ~2.5 wall-clock seconds of travel
 const FOLLOW_ZOOM_HYSTERESIS = 0.7;
 const CAM_TAU_POS = 600;
+const CAM_TAU_ZOOM = 900;
 const CAM_TAU_ARC = 1100;
-let camZooming = false; // a native animated zoom is in flight; per-frame camera stands aside
+const ZOOM_EMA_TAU = 800; // smooths the desired zoom before hysteresis so transients never retarget
+const ZOOM_MIN_RATE = 0.0022; // levels/ms floor: a many-level glide can't drag out a blurry exponential tail
+let camGliding = false; // the camera is mid zoom-transition (fractional zoom on screen)
+let zoomEma = null; // { value, committed, last } — smoothed desired zoom + its value at the last retarget
 
 function camSeedFromMap() {
   const c = playbackMap.getCenter();
-  cam = { lat: c.lat, lng: c.lng, lastFrame: performance.now() };
+  cam = { lat: c.lat, lng: c.lng, zoom: playbackMap.getZoom(), lastFrame: performance.now() };
+  camGliding = false;
 }
 
-/* The camera pans per frame at a constant zoom (a pure translate — cheap and flash-free) and
- * changes zoom only through Leaflet's native animated zoom below, which scales the existing
- * tiles during the transition instead of swapping the pane to freshly-loading tiles. */
-function camUpdate(tLat, tLng, tauPos) {
-  if (camZooming) return;
+/* One continuous per-frame camera for panning AND zooming. At a settled zoom it pans with a
+ * plain setView (a pure pane translate — cheap and flash-free). While the zoom is in transition
+ * it steps the map through the same internal move Leaflet's own flyTo performs each frame
+ * (_move with {flyTo:true} on the pinned Leaflet 1.9.4): existing tiles scale smoothly and tile
+ * loading waits for the landing _moveEnd, so nothing flushes mid-glide — but unlike a flyTo,
+ * the target can be re-aimed every frame, so a speed change mid-glide bends the glide instead
+ * of stranding the camera on a stale ballistic arc. */
+function camUpdate(tLat, tLng, tZoom, tauPos, tauZoom) {
   if (!cam) camSeedFromMap();
   const now = performance.now();
   const dt = Math.min(100, Math.max(0, now - cam.lastFrame));
   cam.lastFrame = now;
-  const aP = 1 - Math.exp(-dt / tauPos);
+  if (tZoom == null) tZoom = cam.zoom;
+  const dz = tZoom - cam.zoom;
+  // while the zoom is in transition the pan converges much harder: a zoom-in multiplies any
+  // leftover centering error by 2^levels, so the centre must effectively lock onto its target
+  // before the zoom lands (the aimed landing point of the old flyTo glides, made continuous)
+  const effTauPos = tauPos / (1 + 2.5 * Math.max(0, Math.abs(dz) - 0.25));
+  const aP = 1 - Math.exp(-dt / effTauPos);
   cam.lat += (tLat - cam.lat) * aP;
   cam.lng += (tLng - cam.lng) * aP;
+  const step = Math.min(Math.abs(dz), Math.max(Math.abs(dz) * (1 - Math.exp(-dt / tauZoom)), ZOOM_MIN_RATE * dt));
+  cam.zoom += Math.sign(dz) * step;
+  if (Math.abs(tZoom - cam.zoom) < 0.02) cam.zoom = tZoom;
+
+  if (cam.zoom !== playbackMap.getZoom()) {
+    if (!camGliding) {
+      camGliding = true;
+      playbackMap._moveStart(true, false);
+    }
+    if (cam.zoom === tZoom) {
+      // glide landed: a plain _move (no flyTo flag) + _moveEnd commits tiles at the final zoom
+      playbackMap._move(L.latLng(cam.lat, cam.lng), cam.zoom)._moveEnd(true);
+      camGliding = false;
+    } else {
+      playbackMap._move(L.latLng(cam.lat, cam.lng), cam.zoom, { flyTo: true });
+    }
+    return;
+  }
   // dead-band: hold the map perfectly still through GPS jitter and stays
   const movedPx = playbackMap
     .latLngToContainerPoint([cam.lat, cam.lng])
     .distanceTo(playbackMap.latLngToContainerPoint(playbackMap.getCenter()));
   if (movedPx < 0.5) return;
   playbackMap.setView([cam.lat, cam.lng], playbackMap.getZoom(), { animate: false });
-}
-
-function startZoomGlide(targetZoom, targetLatLng, durMs) {
-  camZooming = true;
-  playbackMap.once('moveend', () => {
-    camZooming = false;
-    camSeedFromMap(); // pan resumes exactly where the animation landed — no cut
-  });
-  playbackMap.flyTo(targetLatLng, targetZoom, { duration: durMs / 1000, easeLinearity: 0.25 });
-}
-function zoomGlideDurMs(dz) {
-  return Math.min(1400, 800 + 120 * Math.abs(dz));
 }
 
 function computeTargetZoom(pos, aheadPos) {
@@ -1438,24 +1468,33 @@ function computeTargetZoom(pos, aheadPos) {
   return Math.min(16, Math.max(4, zoom)); // 17 loads too sparsely at playback speed
 }
 
-/* zoom targets are hysteretic integers: they re-aim only when the desired zoom moves
- * substantially, and each change rides one animated glide aimed at where the marker will be
- * when the glide lands */
-function updateAutoFollow(pos, aheadPos, freezeZoom, predict) {
-  if (camZooming) return;
+/* zoom targets are hysteretic integers derived from an EMA-smoothed desired zoom: only a
+ * sustained change in how much ground the story covers re-aims the camera, so pace dips,
+ * ease-ins after photo holds, and GPS spacing noise never reach the tiles */
+function updateAutoFollow(pos, aheadPos, freezeZoom) {
   if (!freezeZoom || followZoomTarget == null) {
     const desired = computeTargetZoom(pos, aheadPos);
-    if (followZoomTarget == null || Math.abs(desired - followZoomTarget) > FOLLOW_ZOOM_HYSTERESIS) {
-      followZoomTarget = Math.round(desired);
+    const now = performance.now();
+    if (!zoomEma) zoomEma = { value: desired, committed: desired, last: now };
+    const dtE = Math.min(200, Math.max(0, now - zoomEma.last));
+    zoomEma.last = now;
+    zoomEma.value += (desired - zoomEma.value) * (1 - Math.exp(-dtE / ZOOM_EMA_TAU));
+    if (followZoomTarget == null || Math.abs(zoomEma.value - zoomEma.committed) > FOLLOW_ZOOM_HYSTERESIS) {
+      zoomEma.committed = zoomEma.value;
+      followZoomTarget = Math.round(zoomEma.value);
     }
   }
-  const curZoom = playbackMap.getZoom();
-  if (Math.abs(curZoom - followZoomTarget) > 0.25) {
-    const durMs = zoomGlideDurMs(curZoom - followZoomTarget);
-    startZoomGlide(followZoomTarget, predict ? predict(durMs) : [pos.lat, pos.lng], durMs);
-    return;
-  }
-  camUpdate(pos.lat, pos.lng, CAM_TAU_POS);
+  camUpdate(pos.lat, pos.lng, followZoomTarget, CAM_TAU_POS, CAM_TAU_ZOOM);
+}
+
+/* while the camera is mid zoom-transition, story time itself slows — the dot shouldn't sprint
+ * across the screen during a pull-out. The rate smoothing in playbackTick turns this into a
+ * deliberate slow-down → re-frame → accelerate sequence at chapter changes. */
+function camSettleMultiplier() {
+  if (!followEnabled || !cam || followZoomTarget == null) return 1;
+  const err = Math.abs(cam.zoom - followZoomTarget);
+  if (err <= 0.5) return 1;
+  return Math.max(0.35, 1 - (err - 0.5) * 0.45);
 }
 
 /* ---- single trip playback ---- */
@@ -1554,7 +1593,9 @@ function renderFrame(simTime) {
   }
 
   if (followEnabled && !travelArc) {
-    const rate = playState.rate || currentBaseSpeed(simTime);
+    // zoom framing reads the planned rate (stable within a chapter); the eased actual rate
+    // only steers the feed-forward pan aim below
+    const rate = plannedRate(simTime);
     const aheadPos = pointAtSimTime(pts, Math.min(simTime + rate * FOLLOW_REAL_LOOKAHEAD_MS, playState.maxMs)).pos;
     // feed-forward: the damped camera trails its target by ~speed × tau, so aim one time
     // constant ahead and the marker rides dead-centre instead of drifting toward the edge.
@@ -1563,11 +1604,7 @@ function renderFrame(simTime) {
     const camPos = ev
       ? { lat: ev.lat, lng: ev.lng }
       : pointAtSimTime(pts, Math.min(simTime + (playState.rate || 0) * CAM_TAU_POS, playState.maxMs)).pos;
-    const predict = (ms) => {
-      const p = pointAtSimTime(pts, Math.min(simTime + (playState.rate || 0) * ms, playState.maxMs)).pos;
-      return [p.lat, p.lng];
-    };
-    updateAutoFollow(camPos, aheadPos, !!ev, predict);
+    updateAutoFollow(camPos, aheadPos, !!ev);
   }
 }
 
@@ -1658,21 +1695,18 @@ function legAtSimTime(simTime) {
 function renderHolidayFrame(simTime) {
   const leg = legAtSimTime(simTime);
   const ev = eventAtSimTime(simTime);
-  let pos, partialDist = 0, bannerText, aheadPos, camPos, predict;
+  let pos, partialDist = 0, bannerText, aheadPos, camPos;
 
   if (leg) {
     const local = pointAtSimTime(leg.points, simTime - leg.synthStart);
     pos = local.pos;
     partialDist = updateTrace(leg.points, local.idx, pos, leg.tripId);
     bannerText = ev ? stayLabel(ev) : `${leg.name} · ${fmtDate(leg.realStart)}`;
-    const rate = playState.rate || currentBaseSpeed(simTime);
+    // planned rate frames the zoom; the eased actual rate steers the feed-forward pan aim
+    const rate = plannedRate(simTime);
     aheadPos = pointAtSimTime(leg.points, Math.min(simTime + rate * FOLLOW_REAL_LOOKAHEAD_MS, leg.synthEnd) - leg.synthStart).pos;
     // feed-forward camera target (see renderFrame): keeps the marker centred while moving
     camPos = pointAtSimTime(leg.points, Math.min(simTime + (playState.rate || 0) * CAM_TAU_POS, leg.synthEnd) - leg.synthStart).pos;
-    predict = (ms) => {
-      const p = pointAtSimTime(leg.points, Math.min(simTime + (playState.rate || 0) * ms, leg.synthEnd) - leg.synthStart).pos;
-      return [p.lat, p.lng];
-    };
   } else {
     const prevLeg = [...currentHoliday.legs].reverse().find((l) => l.synthEnd <= simTime);
     const nextLeg = currentHoliday.legs.find((l) => l.synthStart > simTime);
@@ -1683,7 +1717,6 @@ function renderHolidayFrame(simTime) {
     bannerText = nextLeg ? `Traveling to ${nextLeg.name}…` : 'Holiday complete';
     aheadPos = pos;
     camPos = pos;
-    predict = (ms) => [pos.lat, pos.lng];
   }
   playMarker.setLatLng([pos.lat, pos.lng]);
   const arcTip = updateTravelArc(simTime);
@@ -1704,7 +1737,7 @@ function renderHolidayFrame(simTime) {
     updatePaceBadge(simTime);
   }
 
-  if (followEnabled && !travelArc) updateAutoFollow(ev ? { lat: ev.lat, lng: ev.lng } : camPos, aheadPos, !!ev, predict);
+  if (followEnabled && !travelArc) updateAutoFollow(ev ? { lat: ev.lat, lng: ev.lng } : camPos, aheadPos, !!ev);
 }
 
 /* ---- shared playback controls ---- */
@@ -1714,7 +1747,7 @@ function playbackTick(nowReal) {
   playState.lastFrameReal = nowReal;
   // smooth the rate itself: chapter/gap speed steps, pace dips, and hold-resumes all become
   // glides instead of velocity jumps
-  const targetRate = currentBaseSpeed(playState.simTime) * currentPaceMultiplier(playState.simTime);
+  const targetRate = plannedRate(playState.simTime) * camSettleMultiplier();
   const prevRate = playState.rate != null ? playState.rate : targetRate;
   playState.rate = prevRate + (targetRate - prevRate) * (1 - Math.exp(-dtReal / 350));
   const nextSim = playState.simTime + dtReal * playState.rate;
@@ -2513,7 +2546,6 @@ window.addEventListener('DOMContentLoaded', () => {
   const doScrub = (e) => {
     pausePlayback();
     dismissPhotoMemory();
-    if (camZooming) playbackMap.stop(); // cancel an in-flight zoom glide; its moveend re-arms the camera
     followEnabled = true;
     playState.simTime = Math.max(0, Math.min(simFromScrubberX(e.clientX), playState.maxMs));
     rearmMemoriesAfter(playState.simTime);
