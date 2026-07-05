@@ -882,7 +882,16 @@ function currentBaseSpeed(simTime) {
 }
 
 function setupPlaybackMap(legsForGhost) {
-  if (playbackMap) { playbackMap.stop(); playbackMap.remove(); playbackMap = null; }
+  if (playbackMap) {
+    // settle any in-flight animated zoom before teardown — removing a map mid-animation
+    // leaves dangling frame callbacks on detached panes
+    try {
+      playbackMap.stop();
+      playbackMap.setView(playbackMap.getCenter(), playbackMap.getZoom(), { animate: false });
+    } catch (e) { /* map already unusable — removing it is all that's left */ }
+    playbackMap.remove();
+    playbackMap = null;
+  }
   playbackMap = L.map('playbackMap', { zoomControl: false }).setView([20, 0], 3);
   L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
     attribution: '&copy; OpenStreetMap',
@@ -915,6 +924,7 @@ function setupPlaybackMap(legsForGhost) {
   followEnabled = false;
   cam = null;
   followZoomTarget = null;
+  camZooming = false;
   resetTrace();
 }
 
@@ -1002,11 +1012,12 @@ function updateTravelArc(simTime) {
       key: big.key,
       line: L.polyline([], { color: '#E8934A', weight: 3, dashArray: '6,9', opacity: 0.9 }).addTo(playbackMap),
       center: bounds.getCenter(),
-      zoom: playbackMap.getBoundsZoom(bounds),
+      zoom: Math.round(playbackMap.getBoundsZoom(bounds)),
     };
     followEnabled = false;
+    startZoomGlide(travelArc.zoom, [travelArc.center.lat, travelArc.center.lng], zoomGlideDurMs(playbackMap.getZoom() - travelArc.zoom));
   }
-  camUpdate(travelArc.center.lat, travelArc.center.lng, travelArc.zoom, CAM_TAU_ARC, CAM_TAU_ARC);
+  camUpdate(travelArc.center.lat, travelArc.center.lng, CAM_TAU_ARC);
   const f = Math.max(0, Math.min(1, (simTime - big.start) / Math.max(1, big.end - big.start)));
   const pts = arcLatLngs(big.from, big.to, f);
   travelArc.line.setLatLngs(pts);
@@ -1230,6 +1241,7 @@ function highlightCenteredChapter() {
 function enterOverview() {
   pausePlayback();
   dismissPhotoMemory();
+  if (playbackMap && camZooming) playbackMap.stop();
   hideSummary();
   playbackMode = 'overview';
   document.getElementById('playerPanel').style.display = 'none';
@@ -1263,6 +1275,7 @@ function enterPlaying(simTime, autoplay) {
   playState.simTime = Math.max(0, Math.min(simTime, playState.maxMs));
   if (playState.simTime === 0) memoryShownIds.clear();
   else rearmMemoriesAfter(playState.simTime);
+  if (camZooming) playbackMap.stop();
   camSeedFromMap(); // the damped camera glides from wherever the view is now, never cuts
   resetTrace();
   playState.renderFn(playState.simTime);
@@ -1373,36 +1386,46 @@ function hideSummary() {
 /* ---- auto-follow camera: zoom based on how much ground is covered in the next few seconds,
  * so a fast leg (flight/highway) doesn't fly off-screen and a slow one isn't zoomed out to nothing ---- */
 const FOLLOW_REAL_LOOKAHEAD_MS = 2500; // frame the next ~2.5 wall-clock seconds of travel
-const FOLLOW_ZOOM_HYSTERESIS = 0.8;
+const FOLLOW_ZOOM_HYSTERESIS = 0.7;
 const CAM_TAU_POS = 600;
-const CAM_TAU_ZOOM = 1500;
 const CAM_TAU_ARC = 1100;
+let camZooming = false; // a native animated zoom is in flight; per-frame camera stands aside
 
 function camSeedFromMap() {
   const c = playbackMap.getCenter();
-  cam = { lat: c.lat, lng: c.lng, zoom: playbackMap.getZoom(), lastFrame: performance.now() };
-  followZoomTarget = null;
+  cam = { lat: c.lat, lng: c.lng, lastFrame: performance.now() };
 }
 
-/* One continuous damped camera: every frame it eases toward its target (position and zoom)
- * with dt-aware exponential smoothing, so nothing (GPS jitter, pace steps, arc entry/exit)
- * can ever jump the view. */
-function camUpdate(tLat, tLng, tZoom, tauPos, tauZoom) {
+/* The camera pans per frame at a constant zoom (a pure translate — cheap and flash-free) and
+ * changes zoom only through Leaflet's native animated zoom below, which scales the existing
+ * tiles during the transition instead of swapping the pane to freshly-loading tiles. */
+function camUpdate(tLat, tLng, tauPos) {
+  if (camZooming) return;
   if (!cam) camSeedFromMap();
   const now = performance.now();
   const dt = Math.min(100, Math.max(0, now - cam.lastFrame));
   cam.lastFrame = now;
   const aP = 1 - Math.exp(-dt / tauPos);
-  const aZ = 1 - Math.exp(-dt / tauZoom);
   cam.lat += (tLat - cam.lat) * aP;
   cam.lng += (tLng - cam.lng) * aP;
-  cam.zoom += (tZoom - cam.zoom) * aZ;
   // dead-band: hold the map perfectly still through GPS jitter and stays
   const movedPx = playbackMap
     .latLngToContainerPoint([cam.lat, cam.lng])
     .distanceTo(playbackMap.latLngToContainerPoint(playbackMap.getCenter()));
-  if (movedPx < 0.5 && Math.abs(cam.zoom - playbackMap.getZoom()) < 0.02) return;
-  playbackMap.setView([cam.lat, cam.lng], cam.zoom, { animate: false });
+  if (movedPx < 0.5) return;
+  playbackMap.setView([cam.lat, cam.lng], playbackMap.getZoom(), { animate: false });
+}
+
+function startZoomGlide(targetZoom, targetLatLng, durMs) {
+  camZooming = true;
+  playbackMap.once('moveend', () => {
+    camZooming = false;
+    camSeedFromMap(); // pan resumes exactly where the animation landed — no cut
+  });
+  playbackMap.flyTo(targetLatLng, targetZoom, { duration: durMs / 1000, easeLinearity: 0.25 });
+}
+function zoomGlideDurMs(dz) {
+  return Math.min(1400, 800 + 120 * Math.abs(dz));
 }
 
 function computeTargetZoom(pos, aheadPos) {
@@ -1415,14 +1438,24 @@ function computeTargetZoom(pos, aheadPos) {
   return Math.min(16, Math.max(4, zoom)); // 17 loads too sparsely at playback speed
 }
 
-/* zoom targets are hysteretic: they only re-aim when the desired zoom moves substantially,
- * so tiles aren't rescaled frame after frame (the "trippy" shimmer) */
-function updateAutoFollow(pos, aheadPos, freezeZoom) {
+/* zoom targets are hysteretic integers: they re-aim only when the desired zoom moves
+ * substantially, and each change rides one animated glide aimed at where the marker will be
+ * when the glide lands */
+function updateAutoFollow(pos, aheadPos, freezeZoom, predict) {
+  if (camZooming) return;
   if (!freezeZoom || followZoomTarget == null) {
     const desired = computeTargetZoom(pos, aheadPos);
-    if (followZoomTarget == null || Math.abs(desired - followZoomTarget) > FOLLOW_ZOOM_HYSTERESIS) followZoomTarget = desired;
+    if (followZoomTarget == null || Math.abs(desired - followZoomTarget) > FOLLOW_ZOOM_HYSTERESIS) {
+      followZoomTarget = Math.round(desired);
+    }
   }
-  camUpdate(pos.lat, pos.lng, followZoomTarget, CAM_TAU_POS, CAM_TAU_ZOOM);
+  const curZoom = playbackMap.getZoom();
+  if (Math.abs(curZoom - followZoomTarget) > 0.25) {
+    const durMs = zoomGlideDurMs(curZoom - followZoomTarget);
+    startZoomGlide(followZoomTarget, predict ? predict(durMs) : [pos.lat, pos.lng], durMs);
+    return;
+  }
+  camUpdate(pos.lat, pos.lng, CAM_TAU_POS);
 }
 
 /* ---- single trip playback ---- */
@@ -1530,7 +1563,11 @@ function renderFrame(simTime) {
     const camPos = ev
       ? { lat: ev.lat, lng: ev.lng }
       : pointAtSimTime(pts, Math.min(simTime + (playState.rate || 0) * CAM_TAU_POS, playState.maxMs)).pos;
-    updateAutoFollow(camPos, aheadPos, !!ev);
+    const predict = (ms) => {
+      const p = pointAtSimTime(pts, Math.min(simTime + (playState.rate || 0) * ms, playState.maxMs)).pos;
+      return [p.lat, p.lng];
+    };
+    updateAutoFollow(camPos, aheadPos, !!ev, predict);
   }
 }
 
@@ -1621,7 +1658,7 @@ function legAtSimTime(simTime) {
 function renderHolidayFrame(simTime) {
   const leg = legAtSimTime(simTime);
   const ev = eventAtSimTime(simTime);
-  let pos, partialDist = 0, bannerText, aheadPos, camPos;
+  let pos, partialDist = 0, bannerText, aheadPos, camPos, predict;
 
   if (leg) {
     const local = pointAtSimTime(leg.points, simTime - leg.synthStart);
@@ -1632,6 +1669,10 @@ function renderHolidayFrame(simTime) {
     aheadPos = pointAtSimTime(leg.points, Math.min(simTime + rate * FOLLOW_REAL_LOOKAHEAD_MS, leg.synthEnd) - leg.synthStart).pos;
     // feed-forward camera target (see renderFrame): keeps the marker centred while moving
     camPos = pointAtSimTime(leg.points, Math.min(simTime + (playState.rate || 0) * CAM_TAU_POS, leg.synthEnd) - leg.synthStart).pos;
+    predict = (ms) => {
+      const p = pointAtSimTime(leg.points, Math.min(simTime + (playState.rate || 0) * ms, leg.synthEnd) - leg.synthStart).pos;
+      return [p.lat, p.lng];
+    };
   } else {
     const prevLeg = [...currentHoliday.legs].reverse().find((l) => l.synthEnd <= simTime);
     const nextLeg = currentHoliday.legs.find((l) => l.synthStart > simTime);
@@ -1642,6 +1683,7 @@ function renderHolidayFrame(simTime) {
     bannerText = nextLeg ? `Traveling to ${nextLeg.name}…` : 'Holiday complete';
     aheadPos = pos;
     camPos = pos;
+    predict = (ms) => [pos.lat, pos.lng];
   }
   playMarker.setLatLng([pos.lat, pos.lng]);
   const arcTip = updateTravelArc(simTime);
@@ -1662,7 +1704,7 @@ function renderHolidayFrame(simTime) {
     updatePaceBadge(simTime);
   }
 
-  if (followEnabled && !travelArc) updateAutoFollow(ev ? { lat: ev.lat, lng: ev.lng } : camPos, aheadPos, !!ev);
+  if (followEnabled && !travelArc) updateAutoFollow(ev ? { lat: ev.lat, lng: ev.lng } : camPos, aheadPos, !!ev, predict);
 }
 
 /* ---- shared playback controls ---- */
@@ -2471,6 +2513,7 @@ window.addEventListener('DOMContentLoaded', () => {
   const doScrub = (e) => {
     pausePlayback();
     dismissPhotoMemory();
+    if (camZooming) playbackMap.stop(); // cancel an in-flight zoom glide; its moveend re-arms the camera
     followEnabled = true;
     playState.simTime = Math.max(0, Math.min(simFromScrubberX(e.clientX), playState.maxMs));
     rearmMemoriesAfter(playState.simTime);
