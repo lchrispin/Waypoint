@@ -117,6 +117,13 @@ html, body {
 .map-dark .leaflet-tile-pane {
   filter: invert(1) hue-rotate(180deg) brightness(0.95) contrast(0.9) saturate(0.55);
 }
+
+/* playback map runs in full colour; while a photo is surfaced (memory card, lightbox,
+ * moment sheet) the tiles fall back so the photo takes the stage */
+#playbackMap .leaflet-tile-pane { transition: filter 0.4s ease; }
+.map-photo-dim .leaflet-tile-pane {
+  filter: saturate(0.25) brightness(0.7);
+}
 .leaflet-control-attribution { background: rgba(15,27,42,0.75) !important; color: var(--paper-dim) !important; font-size: 9px !important; }
 .leaflet-control-attribution a { color: var(--amber) !important; }
 

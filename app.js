@@ -582,6 +582,158 @@ function queuePlaceLookups() {
   }
 }
 
+/* ---- automatic road alignment (OSRM map matching, cached) ----
+ * Raw GPS wobbles off the road network. For chapters travelled at driving speed, the trace is
+ * map-matched onto roads via the same free OSRM server the importer already uses (1 req/s),
+ * then every original point is projected onto the matched line — timestamps and point counts
+ * untouched, wobble gone. Results persist on the trip record, so it costs one enrichment ever.
+ * Walking legs keep their natural trace. */
+const MATCH_BASE = 'https://router.project-osrm.org/match/v1/driving';
+const ALIGN_MIN_SPEED = 5.5; // median m/s for a segment to count as driving
+const ALIGN_BACKBONE_M = 40; // downsample spacing for match requests
+const ALIGN_MAX_REQUESTS = 20;
+const ALIGN_MAX_PULL_M = 60; // never drag a point further than this onto the "road"
+
+function medianSegmentSpeed(pts, a, b) {
+  const v = [];
+  for (let i = a + 1; i <= b; i++) {
+    const dt = (pts[i].ts - pts[i - 1].ts) / 1000;
+    if (dt > 0) v.push(haversine(pts[i - 1], pts[i]) / dt);
+  }
+  if (!v.length) return 0;
+  v.sort((x, y) => x - y);
+  return v[v.length >> 1];
+}
+
+function movementSegments(pts) {
+  const segs = [];
+  let start = 0;
+  for (const sp of detectStays(pts)) {
+    if (sp.startIdx > start) segs.push([start, sp.startIdx]);
+    start = sp.endIdx;
+  }
+  if (start < pts.length - 1) segs.push([start, pts.length - 1]);
+  return segs;
+}
+
+function downsampleByDistance(pts, a, b, spacing) {
+  const out = [pts[a]];
+  let acc = 0;
+  for (let i = a + 1; i <= b; i++) {
+    acc += haversine(pts[i - 1], pts[i]);
+    if (acc >= spacing) { out.push(pts[i]); acc = 0; }
+  }
+  if (out[out.length - 1] !== pts[b]) out.push(pts[b]);
+  return out;
+}
+
+async function osrmMatch(chunk) {
+  try {
+    const coords = chunk.map((p) => `${p.lng.toFixed(6)},${p.lat.toFixed(6)}`).join(';');
+    const radiuses = chunk.map(() => 20).join(';');
+    const res = await fetch(`${MATCH_BASE}/${coords}?overview=full&geometries=geojson&radiuses=${radiuses}`);
+    await new Promise((r) => setTimeout(r, 1100)); // free OSRM demo server allows 1 req/s
+    if (!res.ok) return null;
+    const data = await res.json();
+    if (data.code !== 'Ok' || !data.matchings || !data.matchings.length) return null;
+    const out = [];
+    for (const m of data.matchings) for (const c of m.geometry.coordinates) out.push([c[1], c[0]]);
+    return out;
+  } catch (e) {
+    return null; // offline or server unavailable — the raw trace stays
+  }
+}
+
+/* snap original points [a..b] onto the matched line with an advancing-cursor projection */
+function projectOntoLine(pts, a, b, line, alignedOut) {
+  const kx = 111320 * Math.cos((pts[a].lat * Math.PI) / 180);
+  const ky = 110540;
+  const P = line.map(([lat, lng]) => [lng * kx, lat * ky]);
+  let cursor = 0;
+  for (let i = a; i <= b; i++) {
+    const x = pts[i].lng * kx, y = pts[i].lat * ky;
+    let best = Infinity, bestPt = null, bestSeg = cursor;
+    const from = Math.max(0, cursor - 5);
+    const to = Math.min(P.length - 2, cursor + 80);
+    for (let s = from; s <= to; s++) {
+      const dx = P[s + 1][0] - P[s][0], dy = P[s + 1][1] - P[s][1];
+      const L2 = dx * dx + dy * dy || 1;
+      let t = ((x - P[s][0]) * dx + (y - P[s][1]) * dy) / L2;
+      t = Math.max(0, Math.min(1, t));
+      const px = P[s][0] + dx * t, py = P[s][1] + dy * t;
+      const d = (x - px) ** 2 + (y - py) ** 2;
+      if (d < best) { best = d; bestPt = [py / ky, px / kx]; bestSeg = s; }
+    }
+    cursor = bestSeg;
+    if (Math.sqrt(best) <= ALIGN_MAX_PULL_M) alignedOut[i] = bestPt;
+  }
+}
+
+async function alignTripToRoads(trip) {
+  if (!navigator.onLine || !trip.points || trip.points.length < 2) return false;
+  if (trip.roadAlign && trip.roadAlign.count === trip.points.length) return false;
+  const pts = trip.points;
+  const aligned = pts.map((p) => [p.lat, p.lng]);
+  let changed = false;
+  let budget = ALIGN_MAX_REQUESTS;
+
+  for (const [a, b] of movementSegments(pts)) {
+    if (b - a < 5 || medianSegmentSpeed(pts, a, b) < ALIGN_MIN_SPEED) continue;
+    let spacing = ALIGN_BACKBONE_M;
+    let backbone = downsampleByDistance(pts, a, b, spacing);
+    while (Math.ceil(backbone.length / 97) > budget && spacing < 700) {
+      spacing *= 2;
+      backbone = downsampleByDistance(pts, a, b, spacing);
+    }
+    const road = [];
+    let matchedInput = 0;
+    for (let i = 0; i < backbone.length - 1 && budget > 0; i += 97) {
+      const chunk = backbone.slice(i, i + 98);
+      if (chunk.length < 2) break;
+      budget--;
+      const geo = await osrmMatch(chunk);
+      if (geo) { for (const c of geo) road.push(c); matchedInput += chunk.length; }
+    }
+    if (road.length < 2 || matchedInput / backbone.length < 0.8) continue;
+    const rawDist = pathDistance(pts.slice(a, b + 1));
+    const roadDist = pathDistance(road.map(([lat, lng]) => ({ lat, lng })));
+    if (roadDist < rawDist * 0.75 || roadDist > rawDist * 1.25) continue; // suspicious match — keep raw
+    projectOntoLine(pts, a, b, road, aligned);
+    changed = true;
+  }
+
+  if (!changed) return false;
+  trip.roadAlign = { count: pts.length, coords: aligned, fetchedAt: Date.now() };
+  await dbPut(trip);
+  return true;
+}
+
+/* prefer road-aligned coordinates when a cached alignment matches this trip's points */
+function effectivePoints(trip) {
+  const ra = trip.roadAlign;
+  if (!ra || !ra.coords || ra.count !== trip.points.length) return trip.points;
+  return trip.points.map((p, i) => ({ ...p, lat: ra.coords[i][0], lng: ra.coords[i][1] }));
+}
+
+/* background enrichment: kicked off on playback open; if the user is still browsing the same
+ * overview when alignment lands, refresh quietly — never swap the path mid-ride */
+async function maybeAlignRoads(trips) {
+  const holidayId = currentHoliday ? currentHoliday.collection.id : null;
+  const tripId = currentPlayTrip ? currentPlayTrip.id : null;
+  let any = false;
+  for (const t of trips) {
+    if (await alignTripToRoads(t)) any = true;
+  }
+  if (!any) return;
+  const sameView = holidayId
+    ? currentHoliday && currentHoliday.collection.id === holidayId
+    : currentPlayTrip && currentPlayTrip.id === tripId;
+  if (sameView && playbackMode === 'overview' && !playState.playing) {
+    if (holidayId) openHolidayPlayback(holidayId);
+    else openPlayback(tripId);
+  }
+}
+
 function nightsBetween(a, b) {
   const d1 = new Date(a); d1.setHours(0, 0, 0, 0);
   const d2 = new Date(b); d2.setHours(0, 0, 0, 0);
@@ -732,11 +884,11 @@ function currentBaseSpeed(simTime) {
 function setupPlaybackMap(legsForGhost) {
   if (playbackMap) { playbackMap.stop(); playbackMap.remove(); playbackMap = null; }
   playbackMap = L.map('playbackMap', { zoomControl: false }).setView([20, 0], 3);
-  playbackMap.getContainer().classList.add('map-dark');
   L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
     attribution: '&copy; OpenStreetMap',
     maxZoom: 19,
     updateWhenZooming: false, // don't flush tiles mid-glide
+    updateWhenIdle: false, // mobile defaults this to true — tiles would wait for the pan to stop
     keepBuffer: 4,
   }).addTo(playbackMap);
 
@@ -751,7 +903,7 @@ function setupPlaybackMap(legsForGhost) {
   activeLine = L.polyline([], { color: '#E8934A', weight: 4 }).addTo(playbackMap);
   tipLine = L.polyline([], { color: '#E8934A', weight: 4 }).addTo(playbackMap);
   const firstPt = legsForGhost[0].points[0];
-  playMarker = L.circleMarker([firstPt.lat, firstPt.lng], { radius: 7, color: '#F0EAD8', fillColor: '#E8934A', fillOpacity: 1, weight: 2 }).addTo(playbackMap);
+  playMarker = L.circleMarker([firstPt.lat, firstPt.lng], { radius: 7, color: '#0F1B2A', fillColor: '#E8934A', fillOpacity: 1, weight: 2 }).addTo(playbackMap);
   if (allBounds) playbackMap.fitBounds(allBounds, { padding: [30, 30] });
   playbackBounds = allBounds;
   photoMarkers = [];
@@ -764,6 +916,17 @@ function setupPlaybackMap(legsForGhost) {
   cam = null;
   followZoomTarget = null;
   resetTrace();
+}
+
+/* the map runs in full colour; it desaturates only while a photo is actually on screen,
+ * so the photo gets the stage and the atlas stays vivid the rest of the time */
+function updatePhotoSpotlight() {
+  if (!playbackMap) return;
+  const on =
+    !!memoryActive ||
+    document.getElementById('photoLightbox').classList.contains('active') ||
+    document.getElementById('momentSheet').classList.contains('active');
+  playbackMap.getContainer().classList.toggle('map-photo-dim', on);
 }
 
 function updateStayPulse(ev) {
@@ -991,9 +1154,11 @@ function openMomentSheet(cluster) {
     enterPlaying(Math.max(0, cluster.entries[0].synth - 60000), true);
   };
   document.getElementById('momentSheet').classList.add('active');
+  updatePhotoSpotlight();
 }
 function closeMomentSheet() {
   document.getElementById('momentSheet').classList.remove('active');
+  updatePhotoSpotlight();
 }
 
 /* ---- overview (atlas) <-> playing (ride-along) ---- */
@@ -1207,7 +1372,7 @@ function hideSummary() {
 
 /* ---- auto-follow camera: zoom based on how much ground is covered in the next few seconds,
  * so a fast leg (flight/highway) doesn't fly off-screen and a slow one isn't zoomed out to nothing ---- */
-const FOLLOW_LOOKAHEAD_MS = 30000;
+const FOLLOW_REAL_LOOKAHEAD_MS = 2500; // frame the next ~2.5 wall-clock seconds of travel
 const FOLLOW_ZOOM_HYSTERESIS = 0.8;
 const CAM_TAU_POS = 600;
 const CAM_TAU_ZOOM = 1500;
@@ -1244,7 +1409,7 @@ function computeTargetZoom(pos, aheadPos) {
   const spanMeters = Math.max(30, haversine(pos, aheadPos));
   const size = playbackMap.getSize ? playbackMap.getSize() : { x: 360, y: 640 };
   const minDim = Math.max(100, Math.min(size.x, size.y));
-  const metersPerPixel = spanMeters / (minDim * 0.22);
+  const metersPerPixel = spanMeters / (minDim * 0.3);
   const latRad = (pos.lat * Math.PI) / 180;
   const zoom = Math.log2((156543.03392 * Math.cos(latRad)) / metersPerPixel);
   return Math.min(16, Math.max(4, zoom)); // 17 loads too sparsely at playback speed
@@ -1272,7 +1437,7 @@ async function openPlayback(id) {
   document.getElementById('playbackTitle').textContent = currentPlayTrip.name;
   document.getElementById('legBanner').classList.remove('active');
   showView('playback');
-  const timeline = buildTripTimeline(currentPlayTrip.points);
+  const timeline = buildTripTimeline(effectivePoints(currentPlayTrip));
   setupPlaybackMap([{ points: timeline.points }]);
   dismissPhotoMemory();
   memoryShownIds = new Set();
@@ -1292,6 +1457,7 @@ async function openPlayback(id) {
   overviewAvailable = playState.chapters.length > 1;
   if (overviewAvailable) enterOverview();
   else enterPlaying(0, false);
+  maybeAlignRoads([currentPlayTrip]);
 }
 
 /* ---- calm frames: text/layout work is throttled, the traced line grows incrementally ---- */
@@ -1355,11 +1521,16 @@ function renderFrame(simTime) {
   }
 
   if (followEnabled && !travelArc) {
-    const aheadPos = pointAtSimTime(pts, Math.min(simTime + FOLLOW_LOOKAHEAD_MS, playState.maxMs)).pos;
-    // during a stay the marker wobbles through the compressed GPS cluster and the lookahead
-    // sweeps wildly across it — anchor the camera on the event's location and freeze the zoom
-    // target so the map holds perfectly still instead of chasing jitter
-    updateAutoFollow(ev ? { lat: ev.lat, lng: ev.lng } : pos, aheadPos, !!ev);
+    const rate = playState.rate || currentBaseSpeed(simTime);
+    const aheadPos = pointAtSimTime(pts, Math.min(simTime + rate * FOLLOW_REAL_LOOKAHEAD_MS, playState.maxMs)).pos;
+    // feed-forward: the damped camera trails its target by ~speed × tau, so aim one time
+    // constant ahead and the marker rides dead-centre instead of drifting toward the edge.
+    // During a stay, anchor on the event's location and freeze the zoom target instead —
+    // the marker only wobbles through the compressed GPS cluster there.
+    const camPos = ev
+      ? { lat: ev.lat, lng: ev.lng }
+      : pointAtSimTime(pts, Math.min(simTime + (playState.rate || 0) * CAM_TAU_POS, playState.maxMs)).pos;
+    updateAutoFollow(camPos, aheadPos, !!ev);
   }
 }
 
@@ -1387,7 +1558,7 @@ function buildHolidayTimeline(tripList) {
   const legs = [];
   const events = [];
   tripList.forEach((trip, i) => {
-    const tl = buildTripTimeline(trip.points); // stays inside a leg compress just like in a single trip
+    const tl = buildTripTimeline(effectivePoints(trip)); // stays inside a leg compress just like in a single trip
     const synthStart = cursor;
     const legPoints = tl.points.map((p) => ({ ...p, ts: synthStart + p.ts }));
     const synthEnd = synthStart + tl.maxMs;
@@ -1440,6 +1611,7 @@ async function openHolidayPlayback(collectionId) {
   queuePlaceLookups();
   overviewAvailable = true; // a holiday always has a story worth an overview
   enterOverview();
+  maybeAlignRoads(tripList);
 }
 
 function legAtSimTime(simTime) {
@@ -1449,14 +1621,17 @@ function legAtSimTime(simTime) {
 function renderHolidayFrame(simTime) {
   const leg = legAtSimTime(simTime);
   const ev = eventAtSimTime(simTime);
-  let pos, partialDist = 0, bannerText, aheadPos;
+  let pos, partialDist = 0, bannerText, aheadPos, camPos;
 
   if (leg) {
     const local = pointAtSimTime(leg.points, simTime - leg.synthStart);
     pos = local.pos;
     partialDist = updateTrace(leg.points, local.idx, pos, leg.tripId);
     bannerText = ev ? stayLabel(ev) : `${leg.name} · ${fmtDate(leg.realStart)}`;
-    aheadPos = pointAtSimTime(leg.points, Math.min(simTime + FOLLOW_LOOKAHEAD_MS, leg.synthEnd) - leg.synthStart).pos;
+    const rate = playState.rate || currentBaseSpeed(simTime);
+    aheadPos = pointAtSimTime(leg.points, Math.min(simTime + rate * FOLLOW_REAL_LOOKAHEAD_MS, leg.synthEnd) - leg.synthStart).pos;
+    // feed-forward camera target (see renderFrame): keeps the marker centred while moving
+    camPos = pointAtSimTime(leg.points, Math.min(simTime + (playState.rate || 0) * CAM_TAU_POS, leg.synthEnd) - leg.synthStart).pos;
   } else {
     const prevLeg = [...currentHoliday.legs].reverse().find((l) => l.synthEnd <= simTime);
     const nextLeg = currentHoliday.legs.find((l) => l.synthStart > simTime);
@@ -1466,6 +1641,7 @@ function renderHolidayFrame(simTime) {
     resetTrace();
     bannerText = nextLeg ? `Traveling to ${nextLeg.name}…` : 'Holiday complete';
     aheadPos = pos;
+    camPos = pos;
   }
   playMarker.setLatLng([pos.lat, pos.lng]);
   const arcTip = updateTravelArc(simTime);
@@ -1486,7 +1662,7 @@ function renderHolidayFrame(simTime) {
     updatePaceBadge(simTime);
   }
 
-  if (followEnabled && !travelArc) updateAutoFollow(ev ? { lat: ev.lat, lng: ev.lng } : pos, aheadPos, !!ev);
+  if (followEnabled && !travelArc) updateAutoFollow(ev ? { lat: ev.lat, lng: ev.lng } : camPos, aheadPos, !!ev);
 }
 
 /* ---- shared playback controls ---- */
@@ -1665,6 +1841,7 @@ function showPhotoMemory(entry) {
   group.forEach((e) => memoryShownIds.add(e.photo.id));
   renderMemoryPhoto();
   document.getElementById('photoMemory').classList.add('active');
+  updatePhotoSpotlight();
   playState.holding = true;
   scheduleMemoryStep();
 }
@@ -1697,6 +1874,7 @@ function dismissPhotoMemory() {
   memoryActive = null;
   playState.holding = false;
   document.getElementById('photoMemory').classList.remove('active');
+  updatePhotoSpotlight();
 }
 
 /* photos ahead of this point may fire again — used after seeking backwards */
@@ -1983,6 +2161,7 @@ function openPhotoLightbox(photo, url) {
   document.getElementById('lightboxImg').src = url;
   document.getElementById('lightboxMeta').textContent = `${fmtDate(photo.ts)} \u00b7 ${fmtClock(photo.ts)}`;
   document.getElementById('photoLightbox').classList.add('active');
+  updatePhotoSpotlight();
 }
 
 /* ================= GOOGLE TIMELINE IMPORT ================= */
@@ -2424,6 +2603,7 @@ window.addEventListener('DOMContentLoaded', () => {
   });
   document.getElementById('lightboxCloseBtn').addEventListener('click', () => {
     document.getElementById('photoLightbox').classList.remove('active');
+    updatePhotoSpotlight();
   });
   document.getElementById('lightboxDeleteBtn').addEventListener('click', async () => {
     if (lightboxPhoto && confirm('Delete this photo?')) {
@@ -2432,6 +2612,7 @@ window.addEventListener('DOMContentLoaded', () => {
       closeMomentSheet();
       const ids = currentHoliday ? currentHoliday.legs.map((l) => l.tripId) : [currentPlayTrip.id];
       await loadPhotoPins(ids);
+      updatePhotoSpotlight();
       if (playbackMode === 'overview') enterOverview(); // re-cluster moments and refresh the strip
     }
   });
