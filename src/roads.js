@@ -45,15 +45,18 @@ async function osrmMatch(chunk) {
   }
 }
 
-/* snap original points [a..b] onto the matched line with an advancing-cursor projection */
+/* snap original points [a..b] onto the matched line with an advancing-cursor projection.
+ * Returns, for every index that landed on the line, its position along it ({ seg, t }) so
+ * the caller can weave the road's own vertices back in between the projected points. */
 function projectOntoLine(pts, a, b, line, alignedOut) {
   const kx = 111320 * Math.cos((pts[a].lat * Math.PI) / 180);
   const ky = 110540;
   const P = line.map(([lat, lng]) => [lng * kx, lat * ky]);
   let cursor = 0;
+  const projInfo = {};
   for (let i = a; i <= b; i++) {
     const x = pts[i].lng * kx, y = pts[i].lat * ky;
-    let best = Infinity, bestPt = null, bestSeg = cursor;
+    let best = Infinity, bestPt = null, bestSeg = cursor, bestT = 0;
     const from = Math.max(0, cursor - 5);
     const to = Math.min(P.length - 2, cursor + 80);
     for (let s = from; s <= to; s++) {
@@ -63,18 +66,51 @@ function projectOntoLine(pts, a, b, line, alignedOut) {
       t = Math.max(0, Math.min(1, t));
       const px = P[s][0] + dx * t, py = P[s][1] + dy * t;
       const d = (x - px) ** 2 + (y - py) ** 2;
-      if (d < best) { best = d; bestPt = [py / ky, px / kx]; bestSeg = s; }
+      if (d < best) { best = d; bestPt = [py / ky, px / kx]; bestSeg = s; bestT = t; }
     }
     cursor = bestSeg;
-    if (Math.sqrt(best) <= ALIGN_MAX_PULL_M) alignedOut[i] = bestPt;
+    if (Math.sqrt(best) <= ALIGN_MAX_PULL_M) { alignedOut[i] = bestPt; projInfo[i] = { seg: bestSeg, t: bestT }; }
   }
+  return projInfo;
+}
+
+/* Projection alone still draws straight chords between GPS samples, so the trace cuts corners
+ * wherever the road curves between fixes. Densify: between each pair of projected points,
+ * insert the matched line's own intermediate vertices with timestamps interpolated by distance
+ * along the road — the drawn line then follows the road's actual curvature. */
+function densifySegment(pts, a, b, line, projInfo, aligned) {
+  const out = [];
+  const at = (i) => ({ lat: aligned[i][0], lng: aligned[i][1], ts: pts[i].ts, speed: pts[i].speed });
+  for (let i = a; i < b; i++) {
+    out.push(at(i));
+    const p1 = projInfo[i], p2 = projInfo[i + 1];
+    if (!p1 || !p2 || p2.seg <= p1.seg) continue; // off-road gap or backward jitter — plain chord
+    const verts = [];
+    for (let v = p1.seg + 1; v <= p2.seg; v++) verts.push({ lat: line[v][0], lng: line[v][1] });
+    if (!verts.length) continue;
+    const chain = [at(i), ...verts, at(i + 1)];
+    const cum = [0];
+    for (let k = 1; k < chain.length; k++) cum.push(cum[k - 1] + haversine(chain[k - 1], chain[k]));
+    const total = cum[cum.length - 1];
+    if (total < 1) continue;
+    const t0 = pts[i].ts, t1 = pts[i + 1].ts;
+    for (let k = 1; k < chain.length - 1; k++) {
+      const f = cum[k] / total;
+      if (f <= 0 || f >= 1) continue;
+      out.push({ lat: chain[k].lat, lng: chain[k].lng, ts: t0 + (t1 - t0) * f });
+    }
+  }
+  out.push(at(b));
+  return out;
 }
 
 export async function alignTripToRoads(trip) {
   if (!navigator.onLine || !trip.points || trip.points.length < 2) return false;
-  if (trip.roadAlign && trip.roadAlign.count === trip.points.length) return false;
+  // a cached alignment without a densified path (written by the legacy app) is upgraded once
+  if (trip.roadAlign && trip.roadAlign.count === trip.points.length && trip.roadAlign.path) return false;
   const pts = trip.points;
   const aligned = pts.map((p) => [p.lat, p.lng]);
+  const stretches = [];
   let changed = false;
   let budget = ALIGN_MAX_REQUESTS;
 
@@ -99,12 +135,23 @@ export async function alignTripToRoads(trip) {
     const rawDist = pathDistance(pts.slice(a, b + 1));
     const roadDist = pathDistance(road.map(([lat, lng]) => ({ lat, lng })));
     if (roadDist < rawDist * 0.75 || roadDist > rawDist * 1.25) continue; // suspicious match — keep raw
-    projectOntoLine(pts, a, b, road, aligned);
+    const projInfo = projectOntoLine(pts, a, b, road, aligned);
+    stretches.push({ a, b, path: densifySegment(pts, a, b, road, projInfo, aligned) });
     changed = true;
   }
 
   if (!changed) return false;
-  trip.roadAlign = { count: pts.length, coords: aligned, fetchedAt: Date.now() };
+  // full-trip densified path: aligned stretches woven with road vertices, everything else raw
+  const path = [];
+  let i = 0;
+  stretches.sort((x, y) => x.a - y.a);
+  for (const st of stretches) {
+    while (i < st.a) { path.push({ lat: aligned[i][0], lng: aligned[i][1], ts: pts[i].ts, speed: pts[i].speed }); i++; }
+    path.push(...st.path);
+    i = st.b + 1;
+  }
+  while (i < pts.length) { path.push({ lat: aligned[i][0], lng: aligned[i][1], ts: pts[i].ts, speed: pts[i].speed }); i++; }
+  trip.roadAlign = { count: pts.length, coords: aligned, path, fetchedAt: Date.now() };
   await dbPutTrip(trip);
   return true;
 }
