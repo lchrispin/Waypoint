@@ -12,9 +12,9 @@
 <link rel="preconnect" href="https://fonts.googleapis.com" />
 <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&family=Space+Mono&display=swap" rel="stylesheet" />
 
-<link rel="stylesheet" href="vendor/maplibre-gl.css" />
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css" />
 <!-- version queries are cache busters, stamped automatically by .github/workflows/stamp-version.yml on each deploy -->
-<link rel="stylesheet" href="style.css?v=dev" />
+<link rel="stylesheet" href="style.css?v=bedce7e5" />
 </head>
 <body>
 <div id="app">
@@ -23,24 +23,24 @@
   <div id="view-home" class="view active">
     <div class="topbar">
       <div class="wordmark">Waypoint<span class="dot"> · trips</span></div>
-      <div class="topbar-actions">
+      <div style="display:flex; gap:8px;">
         <button id="selectModeBtn" class="icon-btn">Select</button>
-        <button id="menuBtn" class="icon-btn" aria-label="Menu">&#8943;</button>
+        <button id="addPhotosHomeBtn" class="icon-btn">Add photos</button>
+        <button id="importBtn" class="icon-btn">Import</button>
       </div>
     </div>
     <div class="content">
       <div id="holidayList"></div>
       <div id="tripList"></div>
     </div>
-    <button id="fabRecord" class="fab">&#9679; Record trip</button>
+    <button id="fabRecord" class="fab">+ Record trip</button>
+    <input type="file" id="homePhotoFileInput" accept="image/*" multiple style="display:none" />
     <div id="selectActionsBar" class="select-actions" style="display:none;">
       <button id="bulkDeleteBtn" class="btn-ghost btn-danger-ghost" disabled>Delete</button>
       <button id="mergeBtn" class="btn-primary btn-teal" disabled>Merge (0)</button>
       <button id="fabCombine" class="btn-primary" disabled>Combine (0)</button>
     </div>
-    <input type="file" id="homePhotoFileInput" accept="image/*" multiple style="display:none" />
     <input type="file" id="timelineFileInput" accept="application/json,.json" style="display:none" />
-    <input type="file" id="restoreFileInput" accept="application/json,.json" style="display:none" />
   </div>
 
   <!-- ===== RECORD ===== -->
@@ -50,7 +50,7 @@
       <div class="wordmark">Recording<span class="dot">&#8230;</span></div>
       <span style="width:20px"></span>
     </div>
-    <div id="recordMap" class="map-area"></div>
+    <div id="recordMap"></div>
     <div class="stat-strip">
       <div class="stat"><div class="stat-label">Elapsed</div><div class="stat-value" id="statElapsed">0:00</div></div>
       <div class="stat"><div class="stat-label">Distance</div><div class="stat-value" id="statDistance">0 m</div></div>
@@ -66,12 +66,12 @@
     <div class="topbar">
       <button id="playbackBackBtn" class="back-btn">&#8592;</button>
       <div class="wordmark" id="playbackTitle" style="color:var(--paper); text-transform:none; font-size:14px;">Trip</div>
-      <div class="topbar-actions">
+      <div style="display:flex; gap:8px;">
         <button id="renameTripBtn" class="icon-btn">Rename</button>
         <button id="deleteTripBtn" class="icon-btn">Delete</button>
       </div>
     </div>
-    <div id="playbackMap" class="map-area"></div>
+    <div id="playbackMap"></div>
     <div id="legBanner" class="leg-banner"></div>
     <div id="photoMemory" class="photo-memory">
       <div class="photo-memory-frame"><img id="photoMemoryImg" alt="Trip photo" /></div>
@@ -83,7 +83,7 @@
         <div class="readout">
           <span id="readoutClock">--:--</span>
           <span id="readoutDist">0 m</span>
-          <span id="readoutSpeed">&#8212;</span>
+          <span id="readoutSpeed">—</span>
           <span id="paceBadge" class="pace-badge"></span>
         </div>
         <div id="storyScrubber" class="story-scrubber"></div>
@@ -116,10 +116,10 @@
       <span style="width:20px"></span>
     </div>
     <div class="content">
-      <p class="import-hint">Your file covers <span id="timelineSpan"></span>. Pick a window to search for trips &#8212; smaller ranges load faster.</p>
-      <label class="field-label" for="rangeStart">From</label>
+      <p class="import-hint">Your file covers <span id="timelineSpan"></span>. Pick a window to search for trips — smaller ranges load faster.</p>
+      <label class="field-label">From</label>
       <input type="date" id="rangeStart" class="date-input" />
-      <label class="field-label" for="rangeEnd">To</label>
+      <label class="field-label">To</label>
       <input type="date" id="rangeEnd" class="date-input" />
       <button id="findTripsBtn" class="btn-primary" style="width:100%; margin-top:20px;">Find trips</button>
     </div>
@@ -142,24 +142,20 @@
   <div id="view-loading" class="view">
     <div class="loading-wrap">
       <div class="loading-glyph">&#9737;</div>
-      <p id="loadingMessage">Working&#8230;</p>
+      <p id="loadingMessage">Reading Timeline file&#8230;</p>
     </div>
   </div>
 
 </div>
 
-<!-- ===== home menu sheet ===== -->
-<div id="menuSheet" class="modal-backdrop">
+<!-- ===== naming modal ===== -->
+<div id="nameModal" class="modal-backdrop">
   <div class="modal-sheet">
-    <h2>Waypoint</h2>
-    <div class="menu-list">
-      <button id="menuAddPhotos" class="menu-item">Add photos<span class="menu-sub">match a batch to your trips by time &amp; place</span></button>
-      <button id="menuImportTimeline" class="menu-item">Import Google Timeline<span class="menu-sub">turn your location history into trips</span></button>
-      <button id="menuExportBackup" class="menu-item">Export backup<span class="menu-sub">everything &#8212; trips, holidays, photos &#8212; in one file</span></button>
-      <button id="menuRestoreBackup" class="menu-item">Restore backup<span class="menu-sub">bring a backup file into this device</span></button>
-    </div>
+    <h2>Name this trip</h2>
+    <input type="text" id="tripNameInput" placeholder="e.g. Coast drive" />
     <div class="modal-row">
-      <button id="menuCloseBtn" class="btn-ghost">Close</button>
+      <button id="cancelName" class="btn-ghost">Cancel</button>
+      <button id="confirmName" class="btn-primary">Start recording</button>
     </div>
   </div>
 </div>
@@ -238,9 +234,7 @@
   </div>
 </div>
 
-<div id="toast" class="toast"></div>
-
-<script src="vendor/maplibre-gl.js"></script>
-<script type="module" src="app.js?v=dev"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+<script src="app.js?v=bedce7e5"></script>
 </body>
 </html>
