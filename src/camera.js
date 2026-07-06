@@ -36,24 +36,57 @@ export function computeTargetZoom(map, pos, aheadPos) {
 }
 
 /* One frame of camera: damp centre and zoom toward the target and jump there.
+ * The centre is damped in SCREEN PIXELS, not degrees: exponential lag in geographic space
+ * is speed × tau in metres, which is invisible zoomed out but several screens wide zoomed
+ * in — that is exactly how fast zoom-ins used to leave the dot behind. Pixel-space damping
+ * keeps the residual lag a constant fraction of the viewport at every zoom level.
  * Dead-band holds the map perfectly still through GPS jitter and stays. */
 export function camStep(cam, target, { tauPos = CAM_TAU_POS, tauZoom = CAM_TAU_ZOOM, zoom = null } = {}) {
+  const map = cam.map;
   const now = performance.now();
   const dt = Math.min(100, Math.max(0, now - cam.lastFrame));
   cam.lastFrame = now;
   const aP = 1 - Math.exp(-dt / tauPos);
-  cam.lat += (target.lat - cam.lat) * aP;
-  cam.lng += (target.lng - cam.lng) * aP;
   let zoomMoved = false;
   if (zoom != null) {
     const aZ = 1 - Math.exp(-dt / tauZoom);
     const dz = (zoom - cam.zoom) * aZ;
     if (Math.abs(dz) > 0.0005) { cam.zoom += dz; zoomMoved = true; }
   }
-  const cur = cam.map.getCenter();
-  const movedPx = cam.map.project([cam.lng, cam.lat]).dist(cam.map.project([cur.lng, cur.lat]));
+  const targetPx = map.project([target.lng, target.lat]);
+  const camPx = map.project([cam.lng, cam.lat]);
+  const nc = map.unproject([
+    camPx.x + (targetPx.x - camPx.x) * aP,
+    camPx.y + (targetPx.y - camPx.y) * aP,
+  ]);
+  cam.lng = nc.lng;
+  cam.lat = nc.lat;
+  const cur = map.getCenter();
+  const movedPx = map.project([cam.lng, cam.lat]).dist(map.project([cur.lng, cur.lat]));
   if (movedPx < 0.5 && !zoomMoved) return;
-  cam.map.jumpTo({ center: [cam.lng, cam.lat], zoom: cam.zoom });
+  map.jumpTo({ center: [cam.lng, cam.lat], zoom: cam.zoom });
+}
+
+/* Hard visibility guarantee: if pos has drifted outside the central box (frac of each half-
+ * dimension), pan the minimum distance that puts it back on the box edge. This is the safety
+ * net under the damped follow — no transient (fast leg, deep zoom-in, manual zoom) may take
+ * the dot off screen. Returns true if it had to intervene. */
+export function clampToView(map, pos, frac = 0.4, cam = null) {
+  const canvas = map.getCanvas();
+  const s = window.devicePixelRatio || 1;
+  const w = canvas.width / s, h = canvas.height / s;
+  if (!w || !h) return false;
+  const p = map.project([pos.lng, pos.lat]);
+  const dx = p.x - w / 2, dy = p.y - h / 2;
+  const mx = (w / 2) * frac, my = (h / 2) * frac;
+  const ox = Math.abs(dx) > mx ? dx - Math.sign(dx) * mx : 0;
+  const oy = Math.abs(dy) > my ? dy - Math.sign(dy) * my : 0;
+  if (!ox && !oy) return false;
+  const c = map.project(map.getCenter());
+  const nc = map.unproject([c.x + ox, c.y + oy]);
+  map.jumpTo({ center: nc });
+  if (cam) { cam.lng = nc.lng; cam.lat = nc.lat; }
+  return true;
 }
 
 /* Camera target that frames two points (used for travel arcs). */
