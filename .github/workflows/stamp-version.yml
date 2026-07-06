@@ -13,6 +13,8 @@ on:
       - style.css
       - index.html
       - sw.js
+      - "src/**"
+      - "vendor/**"
 
 permissions:
   contents: write
