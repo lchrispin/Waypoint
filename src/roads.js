@@ -31,7 +31,8 @@ function medianSegmentSpeed(pts, a, b) {
 async function osrmMatch(chunk) {
   try {
     const coords = chunk.map((p) => `${p.lng.toFixed(6)},${p.lat.toFixed(6)}`).join(';');
-    const radiuses = chunk.map(() => 20).join(';');
+    // accuracy-aware search radius: wobbly fixes get more room to find their road
+    const radiuses = chunk.map((p) => Math.round(Math.min(40, Math.max(15, p.acc || 25)))).join(';');
     const res = await fetch(`${MATCH_BASE}/${coords}?overview=full&geometries=geojson&radiuses=${radiuses}`);
     await new Promise((r) => setTimeout(r, 1100)); // free OSRM demo server allows 1 req/s
     if (!res.ok) return null;
@@ -104,18 +105,31 @@ function densifySegment(pts, a, b, line, projInfo, aligned) {
   return out;
 }
 
+const ALIGN_V = 2; // bump when alignment quality improves enough to justify one re-run per trip
+const RETRY_COOLDOWN_MS = 10 * 60 * 1000;
+
+/* Alignment is MONOTONIC: every run seeds from the coordinates already stored, so a segment
+ * whose match fails this time (demo server down, rate-limited, budget spent) keeps whatever
+ * snapping it already had — a run can improve the trace but never regress it back to raw.
+ * Incomplete runs are marked partial and retried on a later open until one completes. */
 export async function alignTripToRoads(trip) {
   if (!navigator.onLine || !trip.points || trip.points.length < 2) return false;
-  // a cached alignment without a densified path (written by the legacy app) is upgraded once
-  if (trip.roadAlign && trip.roadAlign.count === trip.points.length && trip.roadAlign.path) return false;
+  const prior = trip.roadAlign && trip.roadAlign.count === trip.points.length ? trip.roadAlign : null;
+  if (prior && prior.v === ALIGN_V) {
+    if (!prior.partial) return false; // complete — done for good
+    if (Date.now() - (prior.fetchedAt || 0) < RETRY_COOLDOWN_MS) return false;
+  }
   const pts = trip.points;
-  const aligned = pts.map((p) => [p.lat, p.lng]);
+  // seed from what we already have — never start a re-run from raw
+  const aligned = pts.map((p, i) => (prior && prior.coords ? [prior.coords[i][0], prior.coords[i][1]] : [p.lat, p.lng]));
   const stretches = [];
   let changed = false;
+  let partial = false;
   let budget = ALIGN_MAX_REQUESTS;
 
   for (const [a, b] of movementSegments(pts)) {
     if (b - a < 5 || medianSegmentSpeed(pts, a, b) < ALIGN_MIN_SPEED) continue;
+    if (budget <= 0) { partial = true; break; }
     let spacing = ALIGN_BACKBONE_M;
     let backbone = downsampleByDistance(pts, a, b, spacing);
     while (Math.ceil(backbone.length / 97) > budget && spacing < 700) {
@@ -131,17 +145,25 @@ export async function alignTripToRoads(trip) {
       const geo = await osrmMatch(chunk);
       if (geo) { for (const c of geo) road.push(c); matchedInput += chunk.length; }
     }
-    if (road.length < 2 || matchedInput / backbone.length < 0.8) continue;
+    if (road.length < 2 || matchedInput / backbone.length < 0.8) { partial = true; continue; }
     const rawDist = pathDistance(pts.slice(a, b + 1));
     const roadDist = pathDistance(road.map(([lat, lng]) => ({ lat, lng })));
-    if (roadDist < rawDist * 0.75 || roadDist > rawDist * 1.25) continue; // suspicious match — keep raw
+    if (roadDist < rawDist * 0.75 || roadDist > rawDist * 1.25) { partial = true; continue; } // suspicious match — keep what we have
     const projInfo = projectOntoLine(pts, a, b, road, aligned);
     stretches.push({ a, b, path: densifySegment(pts, a, b, road, projInfo, aligned) });
     changed = true;
   }
 
-  if (!changed) return false;
-  // full-trip densified path: aligned stretches woven with road vertices, everything else raw
+  if (!changed) {
+    // nothing improved; if this was a partial retry, stamp the attempt so the cooldown applies
+    if (prior && prior.v === ALIGN_V && prior.partial) {
+      prior.fetchedAt = Date.now();
+      await dbPutTrip(trip);
+    }
+    return false;
+  }
+  // full-trip densified path: freshly matched stretches woven with road vertices, everything
+  // else (stays, walks, previously matched but not re-fetched segments) as chords of `aligned`
   const path = [];
   let i = 0;
   stretches.sort((x, y) => x.a - y.a);
@@ -151,7 +173,7 @@ export async function alignTripToRoads(trip) {
     i = st.b + 1;
   }
   while (i < pts.length) { path.push({ lat: aligned[i][0], lng: aligned[i][1], ts: pts[i].ts, speed: pts[i].speed }); i++; }
-  trip.roadAlign = { count: pts.length, coords: aligned, path, fetchedAt: Date.now() };
+  trip.roadAlign = { v: ALIGN_V, count: pts.length, coords: aligned, path, partial, fetchedAt: Date.now() };
   await dbPutTrip(trip);
   return true;
 }
