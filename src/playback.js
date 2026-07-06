@@ -15,7 +15,7 @@ import { readExifGps } from './exif.js';
 import { newPhotoId, PHOTO_GPS_ONLY_MAX_M } from './photos.js';
 import { interpolateByRealTs, nearestTrackPoint } from './geo.js';
 import { createMap, ll, ensureLine, setLineCoords, setMultiLine, setFeatures, ensureDot, setDotCoord, setLayerVisible, makeMarker, boundsOf } from './map.js';
-import { createCamera, camSeed, camStep, computeTargetZoom, cameraForPair, CAM_TAU_POS, CAM_TAU_ARC } from './camera.js';
+import { createCamera, camSeed, camStep, clampToView, computeTargetZoom, cameraForPair, CAM_TAU_POS, CAM_TAU_ARC } from './camera.js';
 import { showView, openModal, closeModal, setTextIfChanged } from './views.js';
 import { renderHome } from './home.js';
 
@@ -28,6 +28,7 @@ let overviewAvailable = false;
 let playbackBounds = null;
 let followEnabled = false;
 let followZoomTarget = null;
+let manualZoomUntil = 0; // a user zoom holds auto-zoom off until this time; following continues
 let activeChapterIdx = -1;
 let lastHudAt = 0;
 
@@ -75,8 +76,17 @@ async function ensurePlaybackMap() {
     'circle-stroke-color': '#0F1B2A',
     'circle-stroke-width': 2.5,
   });
-  // a user gesture takes the wheel; playback keeps running but stops steering
-  map.on('movestart', (e) => { if (e.originalEvent) followEnabled = false; });
+  // Gesture semantics: a DRAG means "let me look somewhere else" — following parks until the
+  // next play/seek. A ZOOM means "let me look closer/wider at the action" — following must
+  // continue; auto-zoom just stands aside for a few seconds so it doesn't fight the pinch.
+  // (Disabling follow on zoom was the bug that let the dot sail straight off the screen.)
+  map.on('dragstart', () => { followEnabled = false; });
+  const bumpManualZoom = () => { manualZoomUntil = performance.now() + 5000; };
+  map.on('wheel', bumpManualZoom);
+  map.on('dblclick', bumpManualZoom);
+  map.getContainer().addEventListener('touchstart', (e) => {
+    if (e.touches.length >= 2) bumpManualZoom();
+  }, { passive: true });
   return map;
 }
 
@@ -656,23 +666,32 @@ function renderFrame(simTime) {
   }
 
   if (followEnabled && !travelArc && pts) {
-    const rate = playState.rate || baseSpeed(story, simTime, playState.speed);
-    const clampLocal = (t) => Math.min(t - simBase, pts[pts.length - 1].ts - pts[0].ts);
-    const aheadPos = pointAtSimTime(pts, clampLocal(simTime + rate * FOLLOW_REAL_LOOKAHEAD_MS)).pos;
-    // feed-forward: the damped camera trails its target by ~speed × tau, so aim one time
-    // constant ahead and the marker rides dead-centre instead of drifting toward the edge.
-    // During a stay, anchor on the event's location and freeze the zoom target instead —
-    // the marker only wobbles through the compressed GPS cluster there.
-    const camPos = ev
-      ? { lat: ev.lat, lng: ev.lng }
-      : pointAtSimTime(pts, clampLocal(simTime + (playState.rate || 0) * CAM_TAU_POS)).pos;
-    // during a stay the zoom target freezes; otherwise it re-aims with hysteresis, so the
-    // camera commits to a framing and glides there instead of micro-hunting as speed wobbles
-    if (!ev || followZoomTarget == null) {
-      const desired = computeTargetZoom(map, camPos, aheadPos);
-      if (followZoomTarget == null || Math.abs(desired - followZoomTarget) > 0.5) followZoomTarget = desired;
+    if (performance.now() < manualZoomUntil) {
+      // the user is zooming: hands off the camera, but never let the dot leave the screen,
+      // and stay seeded so following resumes seamlessly from wherever they framed it
+      followZoomTarget = null;
+      clampToView(map, pos, 0.5, cam);
+      camSeed(cam);
+    } else {
+      const rate = playState.rate || baseSpeed(story, simTime, playState.speed);
+      const clampLocal = (t) => Math.min(t - simBase, pts[pts.length - 1].ts - pts[0].ts);
+      const aheadPos = pointAtSimTime(pts, clampLocal(simTime + rate * FOLLOW_REAL_LOOKAHEAD_MS)).pos;
+      // feed-forward: the damped camera trails its target by ~speed × tau, so aim one time
+      // constant ahead and the marker rides dead-centre instead of drifting toward the edge.
+      // During a stay, anchor on the event's location and freeze the zoom target instead —
+      // the marker only wobbles through the compressed GPS cluster there.
+      const camPos = ev
+        ? { lat: ev.lat, lng: ev.lng }
+        : pointAtSimTime(pts, clampLocal(simTime + (playState.rate || 0) * CAM_TAU_POS)).pos;
+      // during a stay the zoom target freezes; otherwise it re-aims with hysteresis, so the
+      // camera commits to a framing and glides there instead of micro-hunting as speed wobbles
+      if (!ev || followZoomTarget == null) {
+        const desired = computeTargetZoom(map, camPos, aheadPos);
+        if (followZoomTarget == null || Math.abs(desired - followZoomTarget) > 0.5) followZoomTarget = desired;
+      }
+      camStep(cam, camPos, { zoom: followZoomTarget });
+      clampToView(map, pos, 0.72, cam); // safety net: no transient may take the dot off screen
     }
-    camStep(cam, camPos, { zoom: followZoomTarget });
   } else if (followEnabled && !travelArc && !pts) {
     camStep(cam, pos, { zoom: null });
   }
