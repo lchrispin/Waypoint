@@ -4,12 +4,11 @@ import { haversine } from './geo.js';
 import { fmtDistance, fmtDuration } from './format.js';
 import { dbPutTrip, dbDeleteTrip } from './db.js';
 import { autoNameTrip } from './places.js';
-import { createMap, ll, ensureLine, setLineCoords, makeMarker } from './map.js';
+import { createMap, ll, ensureLine, setLineCoords, ensureDot, setDotCoord } from './map.js';
 import { showView, showToast } from './views.js';
 import { renderHome } from './home.js';
 
 let recordMap = null;
-let recordMarker = null;
 let watchId = null;
 let currentTrip = null;
 let statTimer = null;
@@ -43,11 +42,17 @@ async function setupRecordMap() {
   recordMap = await createMap('recordMap', { center: [0, 20], zoom: 2 });
   recordMap.resize();
   ensureLine(recordMap, 'record-line', { 'line-color': '#E8934A', 'line-width': 4 });
-  recordMarker = makeMarker(recordMap, 'record-dot', '', { lat: 0, lng: 0 });
+  // GL dot, same reason as playback's playhead: stays glued to the line through zooms
+  ensureDot(recordMap, 'record-head', {
+    'circle-radius': 7,
+    'circle-color': '#E8934A',
+    'circle-stroke-color': '#F0EAD8',
+    'circle-stroke-width': 2.5,
+  });
 }
 
 function teardownRecordMap() {
-  if (recordMap) { recordMap.remove(); recordMap = null; recordMarker = null; }
+  if (recordMap) { recordMap.remove(); recordMap = null; }
 }
 
 function onPosition(pos) {
@@ -71,7 +76,7 @@ function onPosition(pos) {
   if (recordMap) {
     lineCoords.push(ll(p));
     setLineCoords(recordMap, 'record-line', lineCoords);
-    recordMarker.setLngLat(ll(p));
+    setDotCoord(recordMap, 'record-head', ll(p));
     recordMap.jumpTo({ center: ll(p), zoom: Math.max(recordMap.getZoom(), 16) });
   }
 

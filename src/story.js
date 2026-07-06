@@ -103,10 +103,13 @@ export function movementSegments(pts) {
   return segs;
 }
 
-/* prefer road-aligned coordinates when a cached alignment matches this trip's points */
+/* prefer road-aligned coordinates when a cached alignment matches this trip's points;
+ * the densified path (with the road's own curvature vertices) wins when available */
 export function effectivePoints(trip) {
   const ra = trip.roadAlign;
-  if (!ra || !ra.coords || ra.count !== trip.points.length) return trip.points;
+  if (!ra || ra.count !== trip.points.length) return trip.points;
+  if (ra.path && ra.path.length >= trip.points.length) return ra.path;
+  if (!ra.coords) return trip.points;
   return trip.points.map((p, i) => ({ ...p, lat: ra.coords[i][0], lng: ra.coords[i][1] }));
 }
 

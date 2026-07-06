@@ -52,9 +52,27 @@ export async function createMap(container, opts = {}) {
     fadeDuration: 150,
   });
   map.touchZoomRotate.disableRotation();
+  // debug/testing hook — lets tooling drive the live map without threading references around
+  window.__wpMaps = window.__wpMaps || {};
+  window.__wpMaps[typeof container === 'string' ? container : container.id] = map;
+  map.on('error', () => {}); // tile errors are non-fatal; never let them throw to the console loop
+  // Resolve when the STYLE is ready, not on 'load': 'load' additionally waits for the first
+  // tiles, so a hung tile request (flaky connection) would hang the whole view behind it.
+  // Poll rather than listen — 'styledata' can fire once mid-load and then never again,
+  // deadlocking an event-based wait. If the style never finishes (sprite/glyph fetch stuck),
+  // swap to the inline raster fallback, which always loads.
   return new Promise((resolve) => {
-    map.on('load', () => resolve(map));
-    map.on('error', () => {}); // tile errors are non-fatal; never let them throw to the console loop
+    let swapped = style === RASTER_FALLBACK;
+    const deadline = performance.now() + 10000;
+    const tick = () => {
+      if (map.isStyleLoaded()) { resolve(map); return; }
+      if (!swapped && performance.now() > deadline) {
+        swapped = true;
+        try { map.setStyle(RASTER_FALLBACK); } catch (e) { /* keep polling */ }
+      }
+      setTimeout(tick, 50);
+    };
+    tick();
   });
 }
 
@@ -97,12 +115,39 @@ export function removeLayerAndSource(map, id) {
   if (map.getSource(id)) map.removeSource(id);
 }
 
-/* ---- DOM markers ---- */
+/* ---- GL point (playhead/record dot) ----
+ * The moving dot must live INSIDE the GL scene, not as a DOM marker: DOM markers are CSS
+ * transforms updated a beat behind the canvas and snapped to whole pixels, so during a zoom
+ * they visibly slide off the GL-rendered line. A circle layer shares the line's transform
+ * matrix and can never misalign. */
+export function ensureDot(map, id, paint) {
+  if (!map.getSource(id)) {
+    map.addSource(id, { type: 'geojson', data: { type: 'FeatureCollection', features: [] } });
+    map.addLayer({ id, type: 'circle', source: id, paint });
+  }
+  return map.getSource(id);
+}
+
+export function setDotCoord(map, id, coord) {
+  const src = map.getSource(id);
+  if (!src) return;
+  src.setData(coord
+    ? { type: 'Feature', geometry: { type: 'Point', coordinates: coord } }
+    : { type: 'FeatureCollection', features: [] });
+}
+
+export function setLayerVisible(map, id, visible) {
+  if (map.getLayer(id)) map.setLayoutProperty(id, 'visibility', visible ? 'visible' : 'none');
+}
+
+/* ---- DOM markers (photo pins, pulses — things that are HTML by nature) ----
+ * subpixelPositioning stops them snapping to integer pixels, which is what made pins
+ * jitter against the map during slow zooms. */
 export function makeMarker(map, className, html, pos, opts = {}) {
   const el = document.createElement('div');
   el.className = className;
   if (html) el.innerHTML = html;
-  const m = new maplibregl.Marker({ element: el, anchor: 'center', ...opts });
+  const m = new maplibregl.Marker({ element: el, anchor: 'center', subpixelPositioning: true, ...opts });
   m.setLngLat(ll(pos)).addTo(map);
   return m;
 }

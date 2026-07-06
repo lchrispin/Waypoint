@@ -188,16 +188,7 @@ button:focus-visible { outline: 2px solid var(--amber); outline-offset: 2px; }
 }
 .maplibregl-ctrl-attrib a { color: var(--amber) !important; }
 
-/* map markers */
-.play-dot, .record-dot {
-  width: 15px; height: 15px;
-  border-radius: 50%;
-  background: var(--amber);
-  border: 2.5px solid var(--navy);
-  box-shadow: 0 1px 6px rgba(0, 0, 0, 0.5);
-}
-.record-dot { border-color: var(--paper); }
-
+/* map markers (the moving playhead/record dots are GL circle layers, not DOM) */
 .photo-pin { cursor: pointer; }
 .photo-pin-thumb {
   width: 34px; height: 34px;

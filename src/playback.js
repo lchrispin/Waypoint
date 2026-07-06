@@ -14,7 +14,7 @@ import { alignTripToRoads } from './roads.js';
 import { readExifGps } from './exif.js';
 import { newPhotoId, PHOTO_GPS_ONLY_MAX_M } from './photos.js';
 import { interpolateByRealTs, nearestTrackPoint } from './geo.js';
-import { createMap, ll, ensureLine, setLineCoords, setMultiLine, setFeatures, makeMarker, boundsOf } from './map.js';
+import { createMap, ll, ensureLine, setLineCoords, setMultiLine, setFeatures, ensureDot, setDotCoord, setLayerVisible, makeMarker, boundsOf } from './map.js';
 import { createCamera, camSeed, camStep, computeTargetZoom, cameraForPair, CAM_TAU_POS, CAM_TAU_ARC } from './camera.js';
 import { showView, openModal, closeModal, setTextIfChanged } from './views.js';
 import { renderHome } from './home.js';
@@ -31,7 +31,6 @@ let followZoomTarget = null;
 let activeChapterIdx = -1;
 let lastHudAt = 0;
 
-let playMarker = null;
 let stayPulseMarker = null;
 let photoMarkers = [];
 let momentMarkers = [];
@@ -69,6 +68,13 @@ async function ensurePlaybackMap() {
   }
   ensureLine(map, 'trace', { 'line-color': '#E8934A', 'line-width': 4 });
   ensureLine(map, 'arc', { 'line-color': '#E8934A', 'line-width': 3, 'line-opacity': 0.9, 'line-dasharray': [1.6, 1.8] });
+  // the dot rides in the GL scene with the lines so zooming can never pull them apart
+  ensureDot(map, 'playhead', {
+    'circle-radius': 7,
+    'circle-color': '#E8934A',
+    'circle-stroke-color': '#0F1B2A',
+    'circle-stroke-width': 2.5,
+  });
   // a user gesture takes the wheel; playback keeps running but stops steering
   map.on('movestart', (e) => { if (e.originalEvent) followEnabled = false; });
   return map;
@@ -83,15 +89,13 @@ function resetLayers(legsForGhost) {
   photoMarkers = [];
   removeMomentPins();
   if (stayPulseMarker) { stayPulseMarker.remove(); stayPulseMarker = null; }
-  if (playMarker) { playMarker.remove(); playMarker = null; }
   travelArc = null;
   activeChapterIdx = -1;
   followEnabled = false;
   followZoomTarget = null;
   resetTrace();
 
-  const firstPt = legsForGhost[0].points[0];
-  playMarker = makeMarker(map, 'play-dot', '', firstPt);
+  setDotCoord(map, 'playhead', ll(legsForGhost[0].points[0]));
   playbackBounds = boundsOf(legsForGhost.map((leg) => leg.points));
   if (playbackBounds) map.fitBounds(playbackBounds, { padding: 48, duration: 0 });
   cam = createCamera(map);
@@ -435,7 +439,7 @@ function enterOverview() {
   setLineCoords(map, 'trace', []);
   setLineCoords(map, 'arc', []);
   travelArc = null;
-  if (playMarker) playMarker.getElement().style.display = 'none';
+  setLayerVisible(map, 'playhead', false);
   for (const m of photoMarkers) m.getElement().style.display = 'none';
   buildMomentPins();
   buildChapterLines();
@@ -454,7 +458,7 @@ function enterPlaying(simTime, autoplay) {
   document.getElementById('playerPanel').style.display = '';
   removeMomentPins();
   setFeatures(map, 'chapters', []);
-  if (playMarker) playMarker.getElement().style.display = '';
+  setLayerVisible(map, 'playhead', true);
   for (const m of photoMarkers) m.getElement().style.display = '';
   playState.simTime = Math.max(0, Math.min(simTime, playState.maxMs));
   if (playState.simTime === 0) memoryShownIds.clear();
@@ -626,9 +630,8 @@ function renderFrame(simTime) {
     if (ev) bannerText = stayLabel(ev);
   }
 
-  playMarker.setLngLat(ll(pos));
   const arcTip = updateTravelArc(simTime);
-  if (arcTip) playMarker.setLngLat(arcTip);
+  setDotCoord(map, 'playhead', arcTip || ll(pos));
   updateStayPulse(travelArc ? null : ev);
   updateScrubberValue(simTime);
 
@@ -663,8 +666,12 @@ function renderFrame(simTime) {
     const camPos = ev
       ? { lat: ev.lat, lng: ev.lng }
       : pointAtSimTime(pts, clampLocal(simTime + (playState.rate || 0) * CAM_TAU_POS)).pos;
-    // during a stay the zoom target freezes; otherwise it re-aims continuously
-    if (!ev || followZoomTarget == null) followZoomTarget = computeTargetZoom(map, camPos, aheadPos);
+    // during a stay the zoom target freezes; otherwise it re-aims with hysteresis, so the
+    // camera commits to a framing and glides there instead of micro-hunting as speed wobbles
+    if (!ev || followZoomTarget == null) {
+      const desired = computeTargetZoom(map, camPos, aheadPos);
+      if (followZoomTarget == null || Math.abs(desired - followZoomTarget) > 0.5) followZoomTarget = desired;
+    }
     camStep(cam, camPos, { zoom: followZoomTarget });
   } else if (followEnabled && !travelArc && !pts) {
     camStep(cam, pos, { zoom: null });
