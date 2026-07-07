@@ -10,6 +10,7 @@ import {
   startRealTs, positionAt, photoSimTime, computeSpeedKmh,
 } from './story.js';
 import { placeNameSync, requestPlaceName } from './places.js';
+import { downloadGpx } from './gpx.js';
 import { alignTripToRoads } from './roads.js';
 import { readExifGps } from './exif.js';
 import { newPhotoId, PHOTO_GPS_ONLY_MAX_M } from './photos.js';
@@ -1052,6 +1053,16 @@ export function initPlayback() {
         showView('home');
       }
     }
+  });
+
+  document.getElementById('exportGpxBtn').addEventListener('click', async () => {
+    if (!story) return;
+    // fetch fresh from the DB: story points carry synthetic story-time, not wall clocks
+    const allTrips = await dbGetTrips();
+    const wanted = new Set(story.tripIds);
+    const trips = allTrips.filter((t) => wanted.has(t.id)).sort((a, b) => a.startTime - b.startTime);
+    const photos = (await dbGetAllStore('photos')).filter((p) => wanted.has(p.tripId));
+    downloadGpx(story.title, trips, photos);
   });
 
   document.getElementById('renameTripBtn').addEventListener('click', () => {

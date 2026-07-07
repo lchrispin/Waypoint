@@ -13,6 +13,7 @@ const SHELL = [
   './src/views.js',
   './src/db.js',
   './src/geo.js',
+  './src/gpx.js',
   './src/format.js',
   './src/story.js',
   './src/places.js',
