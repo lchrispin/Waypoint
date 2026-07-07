@@ -20,6 +20,11 @@ against `main` @ `d6bf3d5`; re-verify before editing.
 
 ## Phase 0 — Foundations & correctness
 
+> **Status: shipped** (all six items, branch `claude/docs-review-65vvla`). Kept here for
+> the rationale and acceptance criteria; the on-device parts of the acceptance tests
+> (wake lock on a real phone, an outdoor test walk for the accuracy gate) still deserve a
+> pass before relying on them in the field.
+
 ### 0.1 Surface geolocation failures during recording
 
 - **Why**: A GPS error mid-recording is invisible today — the error message goes into a

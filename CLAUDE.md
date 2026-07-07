@@ -19,13 +19,14 @@ preserved in `legacy/` and **shares the same DB schema**. "Routing" is just
 ## Hard invariants — do not break these
 
 1. **DB schema is shared with `legacy/`** (`src/db.js:1-2`). `onupgradeneeded` is
-   create-only (`src/db.js:9-15`); never transform, rename, or drop stores/fields. Rolling
+   create-only (`src/db.js:15-21`); never transform, rename, or drop stores/fields. Rolling
    back to legacy must never strand data. New fields on existing records are fine; readers
    must tolerate their absence.
 2. **No build step.** Plain ES modules loaded directly. Never introduce a bundler,
    transpiler, or npm dependency for app code.
 3. **`sw.js` SHELL list is hand-maintained** (`sw.js:2-29`). Any new file the app loads
-   MUST be added there or offline breaks silently. Bump the `waypoint-v5` cache name
+   MUST be added there or offline breaks silently — CI enforces this
+   (`.github/workflows/shell-guard.yml`). Bump the `waypoint-v5` cache name
    (`sw.js:1`) when changing the SW itself.
 4. **Version stamping is automated.** `.github/workflows/stamp-version.yml` rewrites the
    `?v=` queries on `style.css`/`app.js` in `index.html` on every push to main and commits

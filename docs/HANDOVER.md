@@ -25,7 +25,7 @@ Boot: `index.html` (all views as static divs) → `app.js` (one-line shim) →
 |---|---|---|
 | `src/main.js` | boot + "···" menu sheet wiring | `initApp` |
 | `src/views.js` | the entire "router" + shared UI utils | `showView:2`, `openModal:12`, `setLoading:20`, `showToast:27`, `setTextIfChanged:35` |
-| `src/db.js` | promise-wrapped IndexedDB; opens a fresh connection per call | `dbPutStore`, `dbGetAllStore`, `dbGetStore`, `dbDeleteStore`, trip sugar at `:58-60` |
+| `src/db.js` | promise-wrapped IndexedDB; one cached connection, dropped on `versionchange`/`close` | `dbPutStore`, `dbGetAllStore`, `dbGetStore`, `dbDeleteStore`, trip sugar at end of file |
 | `src/geo.js` | pure geodesy/interpolation, no side effects | `haversine:3`, `lowerBoundIdx:27`, `pointAtSimTime:37`, `interpolateByRealTs:57`, `nearestTrackPoint:69`, `downsampleByDistance:78` |
 | `src/format.js` | pure display formatters | `fmtDistance`, `fmtDuration`, …, `escapeHtml:45` (the app's only XSS guard) |
 | `src/map.js` | MapLibre wrapper; `{lat,lng}`→`[lng,lat]` boundary | `createMap:41`, line/dot/marker helpers, `boundsOf:155` |
@@ -51,7 +51,7 @@ variables.
 ## Data model
 
 IndexedDB `waypointDB`, version 3 (`src/db.js:3-4`). Four stores, all `keyPath:'id'`, no
-indexes. **Upgrades are create-only** (`src/db.js:9-15`) — see invariant #1.
+indexes. **Upgrades are create-only** (`src/db.js:15-21`) — see invariant #1.
 
 ```
 trips:        { id,                 // String(Date.now()) | 'merge-'+ts | import ids
@@ -76,22 +76,30 @@ wants; `src/geo.js` has interpolators for both (`pointAtSimTime`, `interpolateBy
 
 `src/record.js` — FAB starts immediately (no naming modal; the trip names itself later):
 
-1. `startRecording:17` creates the trip (`id = String(Date.now())`, `autoNamed:true`,
-   placeholder name), shows the view, builds the map, then
-   `watchPosition(…, { enableHighAccuracy:true, maximumAge:1000, timeout:15000 })` (`:30`).
-2. `onPosition:58` stores `{lat,lng,alt,speed,acc,ts}`. **Only filter: moves < 1 m are
-   dropped** (`:71`). No accuracy gating (ROADMAP 0.3). Distance accrues per accepted
-   point; the map line/dot update and `jumpTo` follows at min zoom 16.
-3. **Autosave every 15th point** (`:86`) — a crash loses ≤ 14 points.
-4. `stopRecording:108` saves if ≥ 2 points, then fires `autoNameTrip` (`src/places.js:57`)
+1. `startRecording` bails out immediately if the browser lacks geolocation, else creates
+   the trip (`id = String(Date.now())`, `autoNamed:true`, placeholder name), shows the
+   view, acquires a **screen wake lock** (feature-detected + try/caught; re-acquired on
+   `visibilitychange` while a watch is live, since the platform releases it when the page
+   hides), builds the map, then
+   `watchPosition(…, { enableHighAccuracy:true, maximumAge:1000, timeout:15000 })`.
+2. `onPosition` stores `{lat,lng,alt,speed,acc,ts}`. **Filters**: fixes with accuracy
+   worse than `ACC_MAX_M` (50 m) are dropped — never the first fix, the map needs an
+   initial position — and a move must clear the fix's own noise floor
+   (`max(1, min(acc, 25) × 0.5)` m) before it's kept, so a stationary phone with a 20 m
+   lock doesn't random-walk distance upward. Distance accrues per accepted point; the map
+   line/dot update and `jumpTo` follows at min zoom 16. A good fix also clears the GPS
+   status banner.
+3. **Autosave every 15th point** — a crash loses ≤ 14 points.
+4. `stopRecording` saves if ≥ 2 points, then fires `autoNameTrip` (`src/places.js:57`)
    which reverse-geocodes both endpoints → "Lyon → Annecy" / "Siena loop", persists, and
    toasts. Manual rename sets `autoNamed=false`, after which auto-naming never touches it
    (`src/places.js:63`). Un-named trips retry on next launch (`src/home.js:255-259`).
-5. Discard (`:130-141`) deletes the autosaved partial if one was written.
+5. Discard deletes the autosaved partial if one was written. Both stop and discard run
+   through `stopWatching`, which releases the wake lock and hides the banner.
 
-Known gaps (all in ROADMAP Phase 0): geolocation errors go to a tooltip (`:89-91`); no
-wake lock, so screen sleep throttles the watch; unsupported-geolocation path falls through
-after `alert` (`:26-29`).
+GPS failures surface on the record view itself (`#recordBanner`): `PERMISSION_DENIED`
+shows a persistent danger banner ("Location access is blocked…"); `TIMEOUT` /
+`POSITION_UNAVAILABLE` show "Searching for GPS…", auto-cleared by the next good fix.
 
 ## Playback engine
 
@@ -237,16 +245,13 @@ commit.
 
 ## Known fragilities
 
-Each row names the fix that addresses it (see [ROADMAP.md](ROADMAP.md)).
+Each row names the fix that addresses it (see [ROADMAP.md](ROADMAP.md)). Phase 0
+(items 0.1–0.6) shipped: GPS errors banner on the record view, screen wake lock,
+accuracy gating, the Timeline `Math.min` spread crash, the cached DB connection, and the
+CI shell-list guard (`.github/workflows/shell-guard.yml`).
 
 | Where | Symptom | Fix |
 |---|---|---|
-| `src/record.js:89-91` | GPS errors invisible (tooltip only); recording silently stalls | 0.1 |
-| `src/record.js` (absent) | no Wake Lock — screen sleep kills long recordings | 0.2 |
-| `src/record.js:71` | no accuracy gating; bad locks inflate distance/jitter | 0.3 |
-| `src/import-google.js:88-90` | `Math.min(...spread)` RangeError on huge Timeline files | 0.4 |
-| `src/db.js:6` | fresh DB connection per call (hot on autosave) | 0.5 |
-| `sw.js:2-29` | hand-listed shell; a forgotten file breaks offline silently | 0.6 |
 | `src/views.js` (absent) | no history integration — OS back exits the app | A1 |
 | various | native `alert`/`confirm` puncture the UI | A2 |
 | modals, scrubber | no dialog semantics/focus trap; scrubber pointer-only | A3 |
