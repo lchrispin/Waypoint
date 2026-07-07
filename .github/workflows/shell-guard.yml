@@ -1,0 +1,48 @@
+# The SW shell list (sw.js SHELL) is hand-maintained; forgetting to add a new file breaks
+# offline silently — nobody notices until they're on a plane. This guard fails the build
+# naming the missing file. It also checks the reverse (a stale SHELL entry 404s and fails
+# the whole cache.addAll() install) and that index.html's local assets are precached.
+name: Guard SW shell list
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  shell-guard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: sw.js SHELL covers every app file
+        run: |
+          fail=0
+
+          # 1) every ES module in src/ must be precached
+          for f in src/*.js; do
+            if ! grep -qF "'./$f'" sw.js; then
+              echo "::error file=sw.js::'./$f' is missing from the SHELL list — add it or offline breaks silently"
+              fail=1
+            fi
+          done
+
+          # 2) every SHELL entry must exist — one 404 fails the whole cache.addAll() install
+          for entry in $(grep -oE "'\./[^']+'" sw.js | tr -d "'" | sed 's#^\./##'); do
+            if [ ! -e "$entry" ]; then
+              echo "::error file=sw.js::SHELL lists './$entry' but no such file exists"
+              fail=1
+            fi
+          done
+
+          # 3) local assets index.html loads (stylesheet, scripts, manifest, icons) must be precached
+          for asset in $(grep -oE '(href|src)="[^"]+"' index.html \
+              | sed -E 's/^(href|src)="//; s/"$//' \
+              | grep -vE '^https?://' \
+              | sed 's/[?#].*//'); do
+            if ! grep -qF "'./$asset'" sw.js; then
+              echo "::error file=index.html::'$asset' is loaded by index.html but missing from the sw.js SHELL list"
+              fail=1
+            fi
+          done
+
+          exit $fail
