@@ -16,7 +16,7 @@ import { newPhotoId, PHOTO_GPS_ONLY_MAX_M } from './photos.js';
 import { interpolateByRealTs, nearestTrackPoint } from './geo.js';
 import { createMap, ll, ensureLine, setLineCoords, setMultiLine, setFeatures, ensureDot, setDotCoord, setLayerVisible, makeMarker, boundsOf } from './map.js';
 import { createCamera, camSeed, camStep, clampToView, computeTargetZoom, cameraForPair, CAM_TAU_POS, CAM_TAU_ARC } from './camera.js';
-import { showView, openModal, closeModal, setTextIfChanged } from './views.js';
+import { showView, openModal, closeModal, setTextIfChanged, registerViewGuard, registerViewExit } from './views.js';
 import { renderHome } from './home.js';
 
 let map = null;
@@ -146,10 +146,12 @@ export async function openHolidayPlayback(collectionId) {
 }
 
 async function presentStory(allPhotos, tripsToAlign) {
+  const opened = story;
   document.getElementById('playbackTitle').textContent = story.title;
   document.getElementById('legBanner').classList.remove('active');
   showView('playback');
   await ensurePlaybackMap();
+  if (story !== opened) return; // user backed out while the map was initialising
   map.resize(); // the container was display:none until now
   dismissPhotoMemory();
   memoryShownIds = new Set();
@@ -963,11 +965,17 @@ async function resolvePhotoAnchor(file) {
 
 /* ================= wiring ================= */
 export function initPlayback() {
-  document.getElementById('playbackBackBtn').addEventListener('click', () => {
+  // UI back arrow and OS/browser back share one path: the guard steps playing→overview,
+  // the exit handler does the real teardown when the view actually leaves.
+  document.getElementById('playbackBackBtn').addEventListener('click', () => history.back());
+  registerViewGuard('playback', () => {
     if (playbackMode === 'playing' && overviewAvailable) {
       enterOverview();
-      return;
+      return false;
     }
+    return true;
+  });
+  registerViewExit('playback', () => {
     pausePlayback();
     dismissPhotoMemory();
     hideSummary();
@@ -975,7 +983,6 @@ export function initPlayback() {
     photoEntries.forEach((e) => URL.revokeObjectURL(e.url));
     photoEntries = [];
     story = null;
-    showView('home');
     renderHome();
   });
 
@@ -1037,18 +1044,12 @@ export function initPlayback() {
     if (story.kind === 'holiday') {
       if (confirm('Delete this holiday? The individual trips inside it will stay saved.')) {
         await dbDeleteStore('collections', story.id);
-        story = null;
-        pausePlayback();
-        showView('home');
-        renderHome();
+        showView('home'); // the view exit handler pauses, releases photos, re-renders
       }
     } else {
       if (confirm('Delete this trip permanently?')) {
         await dbDeleteTrip(story.id);
-        story = null;
-        pausePlayback();
         showView('home');
-        renderHome();
       }
     }
   });
