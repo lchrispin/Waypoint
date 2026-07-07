@@ -260,6 +260,30 @@ button:focus-visible { outline: 2px solid var(--amber); outline-offset: 2px; }
 }
 .stat .stat-value { font-family: var(--font-data); font-size: 17px; color: var(--paper); }
 
+/* GPS status banner over the record map — same visual language as the leg banner */
+.record-banner {
+  position: absolute;
+  top: calc(66px + env(safe-area-inset-top, 0px));
+  left: 50%;
+  transform: translateX(-50%) translateY(-8px);
+  background: rgba(15, 27, 42, 0.88);
+  border: 1px solid var(--line);
+  color: var(--amber);
+  font-family: var(--font-data);
+  font-size: 12.5px;
+  line-height: 1.45;
+  padding: 8px 16px;
+  border-radius: 999px;
+  text-align: center;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.25s ease, transform 0.25s ease;
+  z-index: 500;
+  max-width: calc(100% - 40px);
+}
+.record-banner.active { opacity: 1; transform: translateX(-50%) translateY(0); }
+.record-banner.danger { color: var(--danger); border-color: var(--danger); }
+
 .record-controls {
   display: flex;
   gap: 12px;

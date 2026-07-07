@@ -8,25 +8,34 @@ import { createMap, ll, ensureLine, setLineCoords, ensureDot, setDotCoord } from
 import { showView, showToast } from './views.js';
 import { renderHome } from './home.js';
 
+/* Fixes with a worse accuracy radius than this are noise (indoors, urban canyon) — storing
+ * them sprays jitter and inflates distance. Generous on purpose: dense urban recording
+ * legitimately runs 20-40 m. The first fix is never gated (the map needs a position). */
+const ACC_MAX_M = 50;
+
 let recordMap = null;
 let watchId = null;
 let currentTrip = null;
 let statTimer = null;
 let lineCoords = [];
+let wakeLock = null;
 
 async function startRecording() {
+  if (!('geolocation' in navigator)) {
+    alert('This browser has no location support.');
+    return;
+  }
+
   const placeholder = `Trip · ${new Date().toLocaleDateString(undefined, { month: 'short', day: 'numeric' })}`;
   currentTrip = { id: String(Date.now()), name: placeholder, autoNamed: true, startTime: Date.now(), endTime: null, points: [], distance: 0 };
 
   showView('record');
   resetStats();
+  hideRecordBanner();
+  acquireWakeLock();
   await setupRecordMap();
   if (!currentTrip) return; // discarded while the map was still loading
 
-  if (!('geolocation' in navigator)) {
-    alert('This browser has no location support.');
-    return;
-  }
   watchId = navigator.geolocation.watchPosition(onPosition, onPositionError, {
     enableHighAccuracy: true,
     maximumAge: 1000,
@@ -34,6 +43,25 @@ async function startRecording() {
   });
 
   statTimer = setInterval(updateElapsedStat, 1000);
+}
+
+/* Keep the screen on while recording: when it sleeps, mobile browsers throttle or stop
+ * watchPosition and long recordings get holes. The platform auto-releases the lock when
+ * the page is hidden, so we re-acquire on return (visibilitychange in initRecord). */
+async function acquireWakeLock() {
+  if (!('wakeLock' in navigator)) return;
+  try {
+    wakeLock = await navigator.wakeLock.request('screen');
+  } catch {
+    wakeLock = null; // can reject (e.g. low battery) — recording works regardless
+  }
+}
+
+function releaseWakeLock() {
+  if (wakeLock) {
+    wakeLock.release().catch(() => {});
+    wakeLock = null;
+  }
 }
 
 async function setupRecordMap() {
@@ -66,9 +94,13 @@ function onPosition(pos) {
     ts: Date.now(),
   };
   const pts = currentTrip.points;
+  if (pts.length > 0 && p.acc > ACC_MAX_M) return; // bad lock — keep waiting, never gate the first fix
+  hideRecordBanner(); // GPS is delivering again — clear any error/searching banner
   if (pts.length > 0) {
     const d = haversine(pts[pts.length - 1], p);
-    if (d < 1) return;
+    // Require the move to clear the fix's own noise floor, or a stationary phone with
+    // 20 m accuracy random-walks distance upward. Floor of 1 m = the old behavior.
+    if (d < Math.max(1, Math.min(p.acc, 25) * 0.5)) return;
     currentTrip.distance += d;
   }
   pts.push(p);
@@ -87,7 +119,23 @@ function onPosition(pos) {
 }
 
 function onPositionError(err) {
-  document.getElementById('statDistance').title = err.message;
+  if (err.code === err.PERMISSION_DENIED) {
+    showRecordBanner('Location access is blocked — enable it in your browser settings', true);
+  } else {
+    // TIMEOUT / POSITION_UNAVAILABLE — transient; onPosition clears this on the next good fix
+    showRecordBanner('Searching for GPS…');
+  }
+}
+
+function showRecordBanner(msg, danger = false) {
+  const el = document.getElementById('recordBanner');
+  el.textContent = msg;
+  el.classList.toggle('danger', danger);
+  el.classList.add('active');
+}
+
+function hideRecordBanner() {
+  document.getElementById('recordBanner').classList.remove('active');
 }
 
 function resetStats() {
@@ -103,6 +151,8 @@ function updateElapsedStat() {
 function stopWatching() {
   if (watchId != null) { navigator.geolocation.clearWatch(watchId); watchId = null; }
   if (statTimer) { clearInterval(statTimer); statTimer = null; }
+  releaseWakeLock();
+  hideRecordBanner();
 }
 
 async function stopRecording() {
@@ -123,6 +173,12 @@ async function stopRecording() {
 
 export function initRecord() {
   document.getElementById('fabRecord').addEventListener('click', startRecording);
+
+  // The platform releases the wake lock whenever the page hides; take it back on return
+  // while a recording is live.
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible' && watchId != null) acquireWakeLock();
+  });
 
   document.getElementById('stopRecordBtn').addEventListener('click', () => {
     if (confirm('Stop and save this trip?')) stopRecording();
