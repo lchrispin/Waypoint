@@ -3,8 +3,14 @@
 const DB_NAME = 'waypointDB';
 const DB_VERSION = 3;
 
+/* One shared connection, opened lazily — recording autosaves every 15th point and a fresh
+ * open per call is needless churn. Cached as the open *promise* so concurrent callers share
+ * the same in-flight open. */
+let dbPromise = null;
+
 function dbOpen() {
-  return new Promise((resolve, reject) => {
+  if (dbPromise) return dbPromise;
+  dbPromise = new Promise((resolve, reject) => {
     const req = indexedDB.open(DB_NAME, DB_VERSION);
     req.onupgradeneeded = () => {
       const db = req.result;
@@ -13,9 +19,17 @@ function dbOpen() {
       if (!db.objectStoreNames.contains('photos')) db.createObjectStore('photos', { keyPath: 'id' });
       if (!db.objectStoreNames.contains('places')) db.createObjectStore('places', { keyPath: 'id' });
     };
-    req.onsuccess = () => resolve(req.result);
-    req.onerror = () => reject(req.error);
+    req.onsuccess = () => {
+      const db = req.result;
+      // A version bump in another tab must not deadlock against our held connection:
+      // close it and let the next call reopen at whatever version wins.
+      db.onversionchange = () => { db.close(); dbPromise = null; };
+      db.onclose = () => { dbPromise = null; };
+      resolve(db);
+    };
+    req.onerror = () => { dbPromise = null; reject(req.error); };
   });
+  return dbPromise;
 }
 
 export async function dbPutStore(store, obj) {
