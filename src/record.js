@@ -5,7 +5,7 @@ import { fmtDistance, fmtDuration } from './format.js';
 import { dbPutTrip, dbDeleteTrip } from './db.js';
 import { autoNameTrip } from './places.js';
 import { createMap, ll, ensureLine, setLineCoords, ensureDot, setDotCoord } from './map.js';
-import { showView, showToast } from './views.js';
+import { showView, showToast, registerViewGuard, registerViewExit } from './views.js';
 import { renderHome } from './home.js';
 
 /* Fixes with a worse accuracy radius than this are noise (indoors, urban canyon) — storing
@@ -166,9 +166,7 @@ async function stopRecording() {
     });
   }
   currentTrip = null;
-  teardownRecordMap();
-  showView('home');
-  renderHome();
+  showView('home'); // the view exit handler tears down the map and re-renders home
 }
 
 export function initRecord() {
@@ -183,16 +181,22 @@ export function initRecord() {
   document.getElementById('stopRecordBtn').addEventListener('click', () => {
     if (confirm('Stop and save this trip?')) stopRecording();
   });
-  document.getElementById('recordBackBtn').addEventListener('click', async () => {
-    if (confirm('Discard this in-progress trip?')) {
-      stopWatching();
-      const discarded = currentTrip;
-      currentTrip = null;
-      teardownRecordMap();
-      // the 15-point autosave may already have written a partial — clean it up
-      if (discarded && discarded.points.length >= 15) await dbDeleteTrip(discarded.id);
-      showView('home');
-      renderHome();
-    }
+
+  // Both the UI back arrow and the OS/browser back button land in the view guard, which
+  // owns the discard confirm — one code path for every way out of a live recording.
+  document.getElementById('recordBackBtn').addEventListener('click', () => history.back());
+  registerViewGuard('record', () => {
+    if (!currentTrip) return true; // already stopped/saved — nothing to protect
+    if (!confirm('Discard this in-progress trip?')) return false;
+    stopWatching();
+    const discarded = currentTrip;
+    currentTrip = null;
+    // the 15-point autosave may already have written a partial — clean it up
+    if (discarded.points.length >= 15) dbDeleteTrip(discarded.id).then(() => renderHome());
+    return true;
+  });
+  registerViewExit('record', () => {
+    teardownRecordMap();
+    renderHome();
   });
 }

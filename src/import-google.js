@@ -5,7 +5,7 @@ import { fmtDate, fmtClock, fmtDistance, fmtDuration, escapeHtml } from './forma
 import { dbPutTrip } from './db.js';
 import { snapToRoad, ROAD_PROFILES } from './roads.js';
 import { autoNameTrip } from './places.js';
-import { showView, setLoading, showToast } from './views.js';
+import { showView, setLoading, showToast, registerViewExit } from './views.js';
 import { renderHome } from './home.js';
 
 let timelineData = null;
@@ -251,10 +251,9 @@ export function initImport() {
     e.target.value = '';
     if (file) loadTimelineFile(file);
   });
-  document.getElementById('dateRangeBackBtn').addEventListener('click', () => {
-    timelineData = null;
-    showView('home');
-  });
+  // Back buttons defer to history so the OS back button walks the same two-step flow
+  document.getElementById('dateRangeBackBtn').addEventListener('click', () => history.back());
+  registerViewExit('daterange', () => { timelineData = null; });
   document.getElementById('findTripsBtn').addEventListener('click', () => {
     const startVal = document.getElementById('rangeStart').value;
     const endVal = document.getElementById('rangeEnd').value;
@@ -269,7 +268,7 @@ export function initImport() {
       showView('import-list');
     }, 20);
   });
-  document.getElementById('importListBackBtn').addEventListener('click', () => showView('daterange'));
+  document.getElementById('importListBackBtn').addEventListener('click', () => history.back());
   document.getElementById('selectAllBtn').addEventListener('click', (e) => {
     const boxes = document.querySelectorAll('.candidateCheck');
     const allChecked = [...boxes].every((b) => b.checked);
