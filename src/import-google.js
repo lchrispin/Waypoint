@@ -85,9 +85,16 @@ function rawPositionsBetween(startMs, endMs) {
 
 function setupDateRangeView() {
   const segs = timelineData.semanticSegments || [];
-  const starts = segs.map((s) => s._startMs).filter((n) => !isNaN(n));
-  const min = new Date(Math.min(...starts));
-  const max = new Date(Math.max(...starts));
+  // Single pass, no spread: a decade of history is hundreds of thousands of segments,
+  // and spreading that many arguments into Math.min/max blows the call stack.
+  let minMs = Infinity, maxMs = -Infinity;
+  for (const s of segs) {
+    if (isNaN(s._startMs)) continue;
+    if (s._startMs < minMs) minMs = s._startMs;
+    if (s._startMs > maxMs) maxMs = s._startMs;
+  }
+  const min = new Date(minMs);
+  const max = new Date(maxMs);
   const toInputDate = (d) => d.toISOString().slice(0, 10);
 
   document.getElementById('timelineSpan').textContent = `${fmtDate(min.getTime())} – ${fmtDate(max.getTime())}`;
