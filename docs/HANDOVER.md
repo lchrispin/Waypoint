@@ -252,15 +252,14 @@ commit.
 ## Known fragilities
 
 Each row names the fix that addresses it (see [ROADMAP.md](ROADMAP.md)). Shipped so far:
-Phase 0 (0.1–0.6), plus A1 (history-API back navigation — see § Navigation below),
-A2 (in-theme `uiConfirm`/`uiAlert` dialogs replace every native `alert`/`confirm`), and
-B1 (GPX export from the playback topbar, `src/gpx.js`).
+Phase 0 (0.1–0.6); A1 (history-API back navigation — see § Navigation); A2 (in-theme
+`uiConfirm`/`uiAlert` dialogs replace every native `alert`/`confirm`); A3 (modals are
+`role=dialog` with focus trap + Escape; the scrubber is a keyboard slider); B1 (GPX
+export, `src/gpx.js`); B2 (backup export streams photos as Blob parts — no OOM).
 
 | Where | Symptom | Fix |
 |---|---|---|
-| modals, scrubber | no dialog semantics/focus trap; scrubber pointer-only | A3 |
 | `src/playback.js:181-185` | alignment refresh reopens the whole view | A4 |
-| `src/backup.js:31-45` | whole DB base64'd into one in-memory string; OOM on big libraries | B2 |
 | `src/import-google.js:53-72` | only on-device Timeline.json shape parses; classic Takeout unsupported | B4 |
 | `src/exif.js:116` | no-offset photos assume device timezone; foreign camera photos misplace | B6 |
 | `src/roads.js:11-12` | OSRM **demo** server: no SLA; whole feature best-effort | B7 |

@@ -171,7 +171,7 @@ against `main` @ `d6bf3d5`; re-verify before editing.
 - **Accept**: No native `alert`/`confirm` remains (grep is clean). Every destructive action
   still requires explicit confirmation. Cancel paths leave state untouched.
 
-### A3. Modal & scrubber accessibility
+### A3. Modal & scrubber accessibility  — ✅ shipped
 
 - **Why**: Modals are plain divs — no `role="dialog"`, no focus trap, no Escape-to-close;
   the story scrubber is pointer-only (`.story-scrubber`, built in `src/playback.js`
@@ -284,7 +284,7 @@ against `main` @ `d6bf3d5`; re-verify before editing.
   times, and elevations; a holiday exports all member trips; filenames are the trip name,
   sanitized.
 
-### B2. Backup format v2 — chunk-safe export
+### B2. Backup format v2 — chunk-safe export  — ✅ shipped
 
 - **Why**: Export base64-encodes every photo blob and serializes the *entire* dataset into
   one in-memory JSON string (`src/backup.js:31-45`). A few hundred photos → hundreds of MB
