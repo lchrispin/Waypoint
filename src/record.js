@@ -5,7 +5,7 @@ import { fmtDistance, fmtDuration } from './format.js';
 import { dbPutTrip, dbDeleteTrip } from './db.js';
 import { autoNameTrip } from './places.js';
 import { createMap, ll, ensureLine, setLineCoords, ensureDot, setDotCoord } from './map.js';
-import { showView, showToast, registerViewGuard, registerViewExit } from './views.js';
+import { showView, showToast, registerViewGuard, registerViewExit, uiConfirm } from './views.js';
 import { renderHome } from './home.js';
 
 /* Fixes with a worse accuracy radius than this are noise (indoors, urban canyon) — storing
@@ -22,7 +22,7 @@ let wakeLock = null;
 
 async function startRecording() {
   if (!('geolocation' in navigator)) {
-    alert('This browser has no location support.');
+    uiAlert({ title: 'No location support', body: 'This browser can’t access GPS, so recording isn’t available here.' });
     return;
   }
 
@@ -178,22 +178,27 @@ export function initRecord() {
     if (document.visibilityState === 'visible' && watchId != null) acquireWakeLock();
   });
 
-  document.getElementById('stopRecordBtn').addEventListener('click', () => {
-    if (confirm('Stop and save this trip?')) stopRecording();
+  document.getElementById('stopRecordBtn').addEventListener('click', async () => {
+    if (await uiConfirm({ title: 'Stop & save this trip?', confirmLabel: 'Stop & save' })) stopRecording();
   });
 
   // Both the UI back arrow and the OS/browser back button land in the view guard, which
-  // owns the discard confirm — one code path for every way out of a live recording.
+  // owns the discard confirm — one code path for every way out of a live recording. The
+  // guard returns a descriptor asking views.js to confirm first; views.js opens the
+  // in-theme dialog in the right history order and runs onConfirm if the user agrees.
   document.getElementById('recordBackBtn').addEventListener('click', () => history.back());
   registerViewGuard('record', () => {
     if (!currentTrip) return true; // already stopped/saved — nothing to protect
-    if (!confirm('Discard this in-progress trip?')) return false;
-    stopWatching();
-    const discarded = currentTrip;
-    currentTrip = null;
-    // the 15-point autosave may already have written a partial — clean it up
-    if (discarded.points.length >= 15) dbDeleteTrip(discarded.id).then(() => renderHome());
-    return true;
+    return {
+      confirm: { title: 'Discard this trip?', body: 'The in-progress recording will be lost.', confirmLabel: 'Discard', danger: true },
+      onConfirm: () => {
+        stopWatching();
+        const discarded = currentTrip;
+        currentTrip = null;
+        // the 15-point autosave may already have written a partial — clean it up
+        if (discarded.points.length >= 15) dbDeleteTrip(discarded.id).then(() => renderHome());
+      },
+    };
   });
   registerViewExit('record', () => {
     teardownRecordMap();

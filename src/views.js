@@ -52,8 +52,10 @@ function navigateHome() {
     const n = stack.length;
     while (stack.length) {
       const top = stack.pop();
-      if (top.type === 'modal') closeModalRaw(top.name);
-      else if (exits[top.name]) exits[top.name]();
+      if (top.type === 'modal') {
+        closeModalRaw(top.name);
+        if (top.name === 'confirmSheet') settleDialog(false);
+      } else if (exits[top.name]) exits[top.name]();
     }
     suppressPops += 1; // history.go fires a single popstate no matter the distance
     history.go(-n);
@@ -81,6 +83,8 @@ export function closeModal(id) {
   }
 }
 
+let bypassGuardOnce = false; // set when an async guard has already approved this one leave
+
 window.addEventListener('popstate', (e) => {
   if (suppressPops > 0) { suppressPops -= 1; return; }
   const depth = (e.state && typeof e.state.depth === 'number') ? e.state.depth : 0;
@@ -95,13 +99,33 @@ window.addEventListener('popstate', (e) => {
     if (top.type === 'modal') {
       stack.pop();
       closeModalRaw(top.name);
+      if (top.name === 'confirmSheet') settleDialog(false); // back cancels an open dialog
       continue;
     }
-    if (guards[top.name] && !guards[top.name]()) {
-      // veto (e.g. discard declined): re-create the popped entry, stay put
-      history.pushState({ depth: stack.length }, '');
-      return;
+    if (!bypassGuardOnce && guards[top.name]) {
+      const res = guards[top.name]();
+      if (res === false) {
+        // veto (e.g. playing→overview, or a plain no): re-create the entry, stay put
+        history.pushState({ depth: stack.length }, '');
+        return;
+      }
+      if (res && res.confirm) {
+        // guard wants to ask first (in-theme confirm). Restore the view entry so we stay
+        // put while the dialog is up; the dialog opens as a normal stacked modal on top,
+        // so the push order stays correct. On yes: run the guard's cleanup, then re-issue
+        // the back with the guard bypassed so this same leave completes without re-asking.
+        history.pushState({ depth: stack.length }, '');
+        uiConfirm(res.confirm).then((ok) => {
+          if (!ok) return;
+          if (res.onConfirm) res.onConfirm();
+          bypassGuardOnce = true;
+          history.back();
+        });
+        return;
+      }
+      // res === true (or any other truthy): fall through and leave
     }
+    bypassGuardOnce = false;
     stack.pop();
     if (exits[top.name]) exits[top.name]();
   }
@@ -115,6 +139,55 @@ export function setLoading(message) {
   document.getElementById('loadingMessage').textContent = message;
   showView('loading');
 }
+
+/* ---------- in-theme dialogs (no native alert/confirm — they puncture the theme) ----------
+ * Promise-returning; the sheet participates in history like any modal, so the OS back
+ * button cancels an open dialog instead of leaving the view behind it. */
+let dialogResolve = null;
+let dialogWired = false;
+
+function settleDialog(val) {
+  if (!dialogResolve) return;
+  const r = dialogResolve;
+  dialogResolve = null;
+  r(val);
+}
+
+function wireDialog() {
+  if (dialogWired) return;
+  dialogWired = true;
+  document.getElementById('confirmOkBtn').addEventListener('click', () => {
+    closeModal('confirmSheet');
+    settleDialog(true);
+  });
+  document.getElementById('confirmCancelBtn').addEventListener('click', () => {
+    closeModal('confirmSheet');
+    settleDialog(false);
+  });
+  document.getElementById('confirmSheet').addEventListener('click', (e) => {
+    if (e.target === e.currentTarget) { closeModal('confirmSheet'); settleDialog(false); }
+  });
+}
+
+function openDialog({ title, body, confirmLabel, cancelLabel, danger, alertOnly }) {
+  wireDialog();
+  settleDialog(false); // a dialog opened over a forgotten one cancels the old one
+  document.getElementById('confirmTitle').textContent = title || '';
+  const bodyEl = document.getElementById('confirmBody');
+  bodyEl.textContent = body || '';
+  bodyEl.style.display = body ? '' : 'none';
+  const ok = document.getElementById('confirmOkBtn');
+  ok.textContent = confirmLabel || 'OK';
+  ok.classList.toggle('btn-danger-solid', !!danger);
+  const cancel = document.getElementById('confirmCancelBtn');
+  cancel.textContent = cancelLabel || 'Cancel';
+  cancel.style.display = alertOnly ? 'none' : '';
+  openModal('confirmSheet');
+  return new Promise((resolve) => { dialogResolve = resolve; });
+}
+
+export function uiConfirm(opts) { return openDialog(opts); }
+export function uiAlert(opts) { return openDialog({ ...opts, alertOnly: true }).then(() => undefined); }
 
 /* Non-blocking toast for background outcomes (auto-naming, photo matching). */
 let toastTimer = null;

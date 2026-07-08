@@ -3,7 +3,7 @@
  * trips, holidays, photos (base64) and the place-name cache; restore is a non-destructive
  * union keyed by id, so it also works as a device-to-device transfer. */
 import { dbGetAllStore, dbPutStore } from './db.js';
-import { showToast } from './views.js';
+import { showToast, uiAlert } from './views.js';
 import { renderHome } from './home.js';
 
 const BACKUP_VERSION = 1;
@@ -58,11 +58,11 @@ export async function restoreBackup(file) {
   try {
     data = JSON.parse(await file.text());
   } catch (e) {
-    alert('Could not read that file — is it a Waypoint backup?');
+    await uiAlert({ title: 'Couldn’t read that file', body: 'It doesn’t parse as a Waypoint backup.' });
     return;
   }
   if (!data || data.app !== 'waypoint' || !Array.isArray(data.trips)) {
-    alert('That file doesn’t look like a Waypoint backup.');
+    await uiAlert({ title: 'Not a Waypoint backup', body: 'That file doesn’t look like a Waypoint backup.' });
     return;
   }
   let trips = 0, photos = 0;

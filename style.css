@@ -542,6 +542,10 @@ button:focus-visible { outline: 2px solid var(--amber); outline-offset: 2px; }
 .btn-danger-ghost { color: var(--danger); border-color: var(--danger); }
 .btn-teal { background: var(--teal); color: var(--paper); }
 
+/* generic confirm/alert dialog */
+.confirm-body { margin: 0 0 18px; color: var(--paper-dim); font-size: 14px; line-height: 1.55; }
+.btn-primary.btn-danger-solid { background: var(--danger); color: var(--paper); }
+
 /* home menu sheet */
 .menu-list { display: flex; flex-direction: column; gap: 8px; margin-bottom: 16px; }
 .menu-item {

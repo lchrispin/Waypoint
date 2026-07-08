@@ -6,7 +6,7 @@ import { fmtDate, fmtDistance, fmtDuration, escapeHtml } from './format.js';
 import { bulkAddPhotos } from './photos.js';
 import { autoNameTrip } from './places.js';
 import { openPlayback, openHolidayPlayback } from './playback.js';
-import { openModal, closeModal, showToast } from './views.js';
+import { openModal, closeModal, showToast, uiConfirm } from './views.js';
 
 let selectMode = false;
 let selectedTripIds = new Set();
@@ -234,7 +234,13 @@ export function initHome() {
   document.getElementById('bulkDeleteBtn').addEventListener('click', async () => {
     const n = selectedTripIds.size;
     if (n === 0) return;
-    if (!confirm(`Delete ${n} trip${n === 1 ? '' : 's'} permanently? This can't be undone.`)) return;
+    const ok = await uiConfirm({
+      title: `Delete ${n} trip${n === 1 ? '' : 's'}?`,
+      body: 'This can’t be undone.',
+      confirmLabel: 'Delete',
+      danger: true,
+    });
+    if (!ok) return;
     for (const id of selectedTripIds) await dbDeleteTrip(id);
     setSelectMode(false);
   });

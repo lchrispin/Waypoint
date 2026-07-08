@@ -5,7 +5,7 @@ import { fmtDate, fmtClock, fmtDistance, fmtDuration, escapeHtml } from './forma
 import { dbPutTrip } from './db.js';
 import { snapToRoad, ROAD_PROFILES } from './roads.js';
 import { autoNameTrip } from './places.js';
-import { showView, setLoading, showToast, registerViewExit } from './views.js';
+import { showView, setLoading, showToast, registerViewExit, uiAlert } from './views.js';
 import { renderHome } from './home.js';
 
 let timelineData = null;
@@ -32,8 +32,8 @@ function loadTimelineFile(file) {
     try {
       timelineData = JSON.parse(reader.result);
     } catch (err) {
-      alert('Could not read that file — is it the Timeline.json export?');
       showView('home');
+      uiAlert({ title: 'Couldn’t read that file', body: 'Is it the Timeline.json export from Google?' });
       return;
     }
     setLoading('Indexing GPS pings…');
@@ -44,8 +44,8 @@ function loadTimelineFile(file) {
     }, 30);
   };
   reader.onerror = () => {
-    alert('Could not read that file.');
     showView('home');
+    uiAlert({ title: 'Couldn’t read that file', body: 'The file couldn’t be opened.' });
   };
   reader.readAsText(file);
 }
@@ -257,10 +257,10 @@ export function initImport() {
   document.getElementById('findTripsBtn').addEventListener('click', () => {
     const startVal = document.getElementById('rangeStart').value;
     const endVal = document.getElementById('rangeEnd').value;
-    if (!startVal || !endVal) { alert('Pick both a start and end date.'); return; }
+    if (!startVal || !endVal) { uiAlert({ title: 'Pick a date range', body: 'Choose both a start and end date.' }); return; }
     const startMs = new Date(startVal + 'T00:00:00').getTime();
     const endMs = new Date(endVal + 'T23:59:59').getTime();
-    if (endMs < startMs) { alert('End date is before start date.'); return; }
+    if (endMs < startMs) { uiAlert({ title: 'Check the dates', body: 'The end date is before the start date.' }); return; }
     setLoading('Finding trips…');
     setTimeout(() => {
       candidateTrips = buildCandidatesForRange(startMs, endMs);
