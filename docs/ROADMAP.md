@@ -122,7 +122,7 @@ against `main` @ `d6bf3d5`; re-verify before editing.
 
 ## Track A — Feel
 
-### A1. History-API back navigation
+### A1. History-API back navigation  — ✅ shipped
 
 - **Why**: The single biggest feel defect. There is zero `pushState`/`popstate`/`hashchange`
   usage (verified), so Android's system back (and browser back) **exits the PWA** instead
@@ -149,7 +149,7 @@ against `main` @ `d6bf3d5`; re-verify before editing.
   home exits the app (normal PWA behavior); back with a modal open closes just the modal;
   back mid-recording asks to discard; forward-nav after back doesn't duplicate views.
 
-### A2. Replace `alert()`/`confirm()` with in-theme dialogs
+### A2. Replace `alert()`/`confirm()` with in-theme dialogs  — ✅ shipped
 
 - **Why**: The app has a strong, coherent visual identity, then punctures it with browser
   chrome at the most emotional moments — deleting a trip, discarding a recording, a failed
@@ -265,7 +265,7 @@ against `main` @ `d6bf3d5`; re-verify before editing.
 
 ## Track B — Functionality
 
-### B1. GPX export (trip and holiday)
+### B1. GPX export (trip and holiday)  — ✅ shipped
 
 - **Why**: The data is locked in. GPX is the lingua franca — one export unlocks Strava,
   Garmin, Google Earth, and peace of mind. Pure client-side, zero regression surface,
