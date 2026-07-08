@@ -17,7 +17,7 @@ import { newPhotoId, PHOTO_GPS_ONLY_MAX_M } from './photos.js';
 import { interpolateByRealTs, nearestTrackPoint } from './geo.js';
 import { createMap, ll, ensureLine, setLineCoords, setMultiLine, setFeatures, ensureDot, setDotCoord, setLayerVisible, makeMarker, boundsOf } from './map.js';
 import { createCamera, camSeed, camStep, clampToView, computeTargetZoom, cameraForPair, CAM_TAU_POS, CAM_TAU_ARC } from './camera.js';
-import { showView, openModal, closeModal, setTextIfChanged, registerViewGuard, registerViewExit } from './views.js';
+import { showView, openModal, closeModal, setTextIfChanged, registerViewGuard, registerViewExit, uiConfirm, uiAlert } from './views.js';
 import { renderHome } from './home.js';
 
 let map = null;
@@ -117,7 +117,7 @@ export async function openPlayback(id) {
   const trips = await dbGetTrips();
   const trip = trips.find((t) => t.id === id);
   if (!trip || trip.points.length < 2) {
-    alert('This trip doesn’t have enough GPS points to play back.');
+    uiAlert({ title: 'Not enough to play back', body: 'This trip doesn’t have enough GPS points.' });
     return;
   }
   const allPhotos = await dbGetAllStore('photos');
@@ -136,7 +136,7 @@ export async function openHolidayPlayback(collectionId) {
     .filter((t) => t && t.points && t.points.length >= 2)
     .sort((a, b) => a.startTime - b.startTime);
   if (tripList.length === 0) {
-    alert('None of the trips in this holiday could be found — they may have been deleted.');
+    uiAlert({ title: 'Holiday is empty', body: 'None of its trips could be found — they may have been deleted.' });
     return;
   }
   const allPhotos = await dbGetAllStore('photos');
@@ -1043,12 +1043,14 @@ export function initPlayback() {
   document.getElementById('deleteTripBtn').addEventListener('click', async () => {
     if (!story) return;
     if (story.kind === 'holiday') {
-      if (confirm('Delete this holiday? The individual trips inside it will stay saved.')) {
+      const ok = await uiConfirm({ title: 'Delete this holiday?', body: 'The individual trips inside it will stay saved.', confirmLabel: 'Delete', danger: true });
+      if (ok) {
         await dbDeleteStore('collections', story.id);
         showView('home'); // the view exit handler pauses, releases photos, re-renders
       }
     } else {
-      if (confirm('Delete this trip permanently?')) {
+      const ok = await uiConfirm({ title: 'Delete this trip?', body: 'This can’t be undone.', confirmLabel: 'Delete', danger: true });
+      if (ok) {
         await dbDeleteTrip(story.id);
         showView('home');
       }
@@ -1108,7 +1110,9 @@ export function initPlayback() {
     updatePhotoSpotlight();
   });
   document.getElementById('lightboxDeleteBtn').addEventListener('click', async () => {
-    if (lightboxPhoto && confirm('Delete this photo?')) {
+    if (!lightboxPhoto) return;
+    const ok = await uiConfirm({ title: 'Delete this photo?', confirmLabel: 'Delete', danger: true });
+    if (ok) {
       await dbDeleteStore('photos', lightboxPhoto.id);
       closeModal('photoLightbox');
       closeMomentSheet();
