@@ -13,10 +13,10 @@ let rawPositions = [];
 let candidateTrips = [];
 
 const ACTIVITY_LABELS = {
-  WALKING: 'Walk', RUNNING: 'Run', ON_BICYCLE: 'Cycle',
-  IN_PASSENGER_VEHICLE: 'Drive', IN_BUS: 'Bus', IN_TRAIN: 'Train',
-  IN_SUBWAY: 'Subway', IN_FERRY: 'Ferry', FLYING: 'Flight',
-  IN_ROAD_VEHICLE: 'Drive', IN_RAIL_VEHICLE: 'Train', UNKNOWN: 'Trip',
+  WALKING: 'Walk', RUNNING: 'Run', ON_BICYCLE: 'Cycle', CYCLING: 'Cycle',
+  IN_PASSENGER_VEHICLE: 'Drive', IN_VEHICLE: 'Drive', IN_BUS: 'Bus', IN_TRAIN: 'Train',
+  IN_SUBWAY: 'Subway', IN_TRAM: 'Tram', IN_FERRY: 'Ferry', FLYING: 'Flight',
+  IN_ROAD_VEHICLE: 'Drive', IN_RAIL_VEHICLE: 'Train', MOTORCYCLING: 'Ride', UNKNOWN: 'Trip',
 };
 
 function parseLatLng(str) {
@@ -25,29 +25,149 @@ function parseLatLng(str) {
   return { lat: parseFloat(nums[0]), lng: parseFloat(nums[1]) };
 }
 
-function loadTimelineFile(file) {
-  setLoading('Reading Timeline file…');
-  const reader = new FileReader();
-  reader.onload = () => {
-    try {
-      timelineData = JSON.parse(reader.result);
-    } catch (err) {
-      showView('home');
-      uiAlert({ title: 'Couldn’t read that file', body: 'Is it the Timeline.json export from Google?' });
-      return;
+/* ---- Google export normalisers -------------------------------------------------------
+ * Three shapes reach us: the on-device Timeline.json (rawSignals + semanticSegments), the
+ * classic Semantic Location History (timelineObjects), and Records.json (locations[]). We
+ * normalise the two classic shapes INTO the on-device internal shape ({rawSignals,
+ * semanticSegments}) so indexRawSignals / setupDateRangeView / buildCandidatesForRange stay
+ * literally unchanged — new shapes are new branches feeding the same structures. */
+const e7 = (v) => (typeof v === 'number' ? v / 1e7 : NaN);
+const isoOf = (ms) => new Date(ms).toISOString();
+
+// timestamps come as ISO ("...timestamp") or ms-since-epoch strings ("...timestampMs")
+function googleTs(obj, isoKey, msKey) {
+  if (obj && obj[isoKey]) { const t = Date.parse(obj[isoKey]); if (!isNaN(t)) return t; }
+  if (obj && obj[msKey] != null) { const t = Number(obj[msKey]); if (!isNaN(t)) return t; }
+  return NaN;
+}
+
+function fromTimelineObjects(objs) {
+  const segs = [];
+  for (const o of objs) {
+    const a = o && o.activitySegment;
+    if (!a) continue; // placeVisit is a stay, not a trip — story compression handles those
+    const startMs = googleTs(a.duration || {}, 'startTimestamp', 'startTimestampMs');
+    const endMs = googleTs(a.duration || {}, 'endTimestamp', 'endTimestampMs');
+    if (isNaN(startMs) || isNaN(endMs)) continue;
+
+    // path preference: simplifiedRawPath (has timestamps) > waypointPath (interpolate times)
+    let timelinePath = null;
+    const srp = a.simplifiedRawPath && a.simplifiedRawPath.points;
+    if (Array.isArray(srp) && srp.length >= 2) {
+      timelinePath = srp
+        .map((p) => ({ point: `${e7(p.latE7)}, ${e7(p.lngE7)}`, time: isoOf(googleTs(p, 'timestamp', 'timestampMs')) }))
+        .filter((p) => !p.time.startsWith('Invalid') && !/NaN/.test(p.point));
     }
-    setLoading('Indexing GPS pings…');
-    setTimeout(() => {
-      indexRawSignals();
-      setupDateRangeView();
-      showView('daterange');
-    }, 30);
-  };
-  reader.onerror = () => {
+    if (!timelinePath || timelinePath.length < 2) {
+      const wps = a.waypointPath && a.waypointPath.waypoints;
+      if (Array.isArray(wps) && wps.length >= 2) {
+        const n = wps.length;
+        timelinePath = wps
+          .map((p, i) => ({ point: `${e7(p.latE7)}, ${e7(p.lngE7)}`, time: isoOf(startMs + (endMs - startMs) * (i / (n - 1))) }))
+          .filter((p) => !/NaN/.test(p.point));
+      } else {
+        timelinePath = null;
+      }
+    }
+
+    const seg = { startTime: isoOf(startMs), endTime: isoOf(endMs), _normType: a.activityType || 'UNKNOWN' };
+    if (timelinePath && timelinePath.length >= 2) {
+      seg.timelinePath = timelinePath;
+    } else {
+      const s = a.startLocation, e = a.endLocation;
+      if (!s || !e) continue;
+      seg.activity = {
+        start: { latLng: `${e7(s.latitudeE7)}, ${e7(s.longitudeE7)}` },
+        end: { latLng: `${e7(e.latitudeE7)}, ${e7(e.longitudeE7)}` },
+        topCandidate: { type: a.activityType || 'UNKNOWN' },
+        distanceMeters: a.distance || a.distanceMeters || null,
+      };
+    }
+    segs.push(seg);
+  }
+  return { rawSignals: [], semanticSegments: segs };
+}
+
+function fromRecords(locations) {
+  const positions = [];
+  for (const p of locations) {
+    const lat = e7(p.latitudeE7), lng = e7(p.longitudeE7);
+    const ts = googleTs(p, 'timestamp', 'timestampMs');
+    if (isNaN(lat) || isNaN(lng) || isNaN(ts)) continue;
+    positions.push({ ts, lat, lng });
+  }
+  positions.sort((a, b) => a.ts - b.ts);
+  const rawSignals = positions.map((p) => ({ position: { LatLng: `${p.lat}, ${p.lng}`, timestamp: isoOf(p.ts) } }));
+
+  // Records.json carries no segments — split the position stream on gaps > 25 min so each
+  // continuous run becomes a route candidate (short/stationary runs get filtered by distance).
+  const segs = [];
+  const GAP_MS = 25 * 60000;
+  let runStart = 0;
+  for (let i = 1; i <= positions.length; i++) {
+    const boundary = i === positions.length || positions[i].ts - positions[i - 1].ts > GAP_MS;
+    if (boundary) {
+      if (i - runStart >= 2) {
+        const run = positions.slice(runStart, i);
+        segs.push({
+          startTime: isoOf(run[0].ts),
+          endTime: isoOf(run[run.length - 1].ts),
+          timelinePath: run.map((p) => ({ point: `${p.lat}, ${p.lng}`, time: isoOf(p.ts) })),
+        });
+      }
+      runStart = i;
+    }
+  }
+  return { rawSignals, semanticSegments: segs };
+}
+
+// Detect the shape and normalise; returns {rawSignals, semanticSegments} or null if unknown.
+function normalizeTimeline(data) {
+  if (!data || typeof data !== 'object') return null;
+  if (Array.isArray(data.semanticSegments) || Array.isArray(data.rawSignals)) {
+    return { rawSignals: data.rawSignals || [], semanticSegments: data.semanticSegments || [] };
+  }
+  if (Array.isArray(data.timelineObjects)) return fromTimelineObjects(data.timelineObjects);
+  if (Array.isArray(data.locations)) return fromRecords(data.locations);
+  return null;
+}
+
+async function loadTimelineFiles(files) {
+  setLoading('Reading Timeline file…');
+  // Merge across files: classic Takeout ships monthly semantic files, often alongside a
+  // Records.json, so accept several and concatenate their normalised structures.
+  const merged = { rawSignals: [], semanticSegments: [] };
+  let unrecognized = 0;
+  for (const file of files) {
+    let parsed;
+    try {
+      parsed = JSON.parse(await file.text());
+    } catch (err) {
+      unrecognized++;
+      continue;
+    }
+    const norm = normalizeTimeline(parsed);
+    if (!norm) { unrecognized++; continue; }
+    merged.rawSignals.push(...norm.rawSignals);
+    merged.semanticSegments.push(...norm.semanticSegments);
+  }
+
+  if (merged.semanticSegments.length === 0) {
     showView('home');
-    uiAlert({ title: 'Couldn’t read that file', body: 'The file couldn’t be opened.' });
-  };
-  reader.readAsText(file);
+    const body = unrecognized === files.length
+      ? 'None of those files look like a Google export — expected Timeline.json, a Semantic Location History file, or Records.json.'
+      : 'No trips were found in that export. Try a Semantic Location History file or Records.json.';
+    await uiAlert({ title: 'No trips found', body });
+    return;
+  }
+
+  timelineData = merged;
+  setLoading('Indexing GPS pings…');
+  setTimeout(() => {
+    indexRawSignals();
+    setupDateRangeView();
+    showView('daterange');
+  }, 30);
 }
 
 function indexRawSignals() {
@@ -153,6 +273,9 @@ function buildCandidatesForRange(startMs, endMs) {
 
     if (!points || points.length < 2) continue;
 
+    // normalised classic segments carry the activity type even on the timelinePath branch
+    if (seg._normType && ACTIVITY_LABELS[seg._normType]) typeLabel = ACTIVITY_LABELS[seg._normType];
+
     let distance = fallbackDistance;
     if (distance == null) distance = pathDistance(points);
     if (distance < 20) continue;
@@ -247,9 +370,9 @@ async function importSelectedCandidates() {
 
 export function initImport() {
   document.getElementById('timelineFileInput').addEventListener('change', (e) => {
-    const file = e.target.files[0];
+    const files = [...e.target.files];
     e.target.value = '';
-    if (file) loadTimelineFile(file);
+    if (files.length) loadTimelineFiles(files);
   });
   // Back buttons defer to history so the OS back button walks the same two-step flow
   document.getElementById('dateRangeBackBtn').addEventListener('click', () => history.back());
