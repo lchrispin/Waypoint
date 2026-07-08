@@ -88,7 +88,8 @@
           <span id="readoutSpeed">&#8212;</span>
           <span id="paceBadge" class="pace-badge"></span>
         </div>
-        <div id="storyScrubber" class="story-scrubber"></div>
+        <div id="storyScrubber" class="story-scrubber" role="slider" tabindex="0"
+             aria-label="Playback position" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"></div>
         <div class="playback-buttons">
           <button id="playToggle" class="play-toggle">&#9654;</button>
           <div class="speed-select">
@@ -152,8 +153,8 @@
 
 <!-- ===== home menu sheet ===== -->
 <div id="menuSheet" class="modal-backdrop">
-  <div class="modal-sheet">
-    <h2>Waypoint</h2>
+  <div class="modal-sheet" role="dialog" aria-modal="true" aria-labelledby="menuSheetTitle">
+    <h2 id="menuSheetTitle">Waypoint</h2>
     <div class="menu-list">
       <button id="menuAddPhotos" class="menu-item">Add photos<span class="menu-sub">match a batch to your trips by time &amp; place</span></button>
       <button id="menuImportTimeline" class="menu-item">Import Google Timeline<span class="menu-sub">turn your location history into trips</span></button>
@@ -168,8 +169,8 @@
 
 <!-- ===== holiday naming modal ===== -->
 <div id="holidayNameModal" class="modal-backdrop">
-  <div class="modal-sheet">
-    <h2>Name this holiday</h2>
+  <div class="modal-sheet" role="dialog" aria-modal="true" aria-labelledby="holidayNameTitle">
+    <h2 id="holidayNameTitle">Name this holiday</h2>
     <input type="text" id="holidayNameInput" placeholder="e.g. Italy 2026" />
     <div class="modal-row">
       <button id="cancelHolidayName" class="btn-ghost">Cancel</button>
@@ -180,8 +181,8 @@
 
 <!-- ===== merge naming modal ===== -->
 <div id="mergeNameModal" class="modal-backdrop">
-  <div class="modal-sheet">
-    <h2>Name the merged trip</h2>
+  <div class="modal-sheet" role="dialog" aria-modal="true" aria-labelledby="mergeNameTitle">
+    <h2 id="mergeNameTitle">Name the merged trip</h2>
     <input type="text" id="mergeNameInput" placeholder="e.g. Coast drive" />
     <div class="modal-row">
       <button id="cancelMergeName" class="btn-ghost">Cancel</button>
@@ -192,7 +193,7 @@
 
 <!-- ===== generic confirm/alert dialog (uiConfirm / uiAlert in views.js) ===== -->
 <div id="confirmSheet" class="modal-backdrop">
-  <div class="modal-sheet">
+  <div class="modal-sheet" role="dialog" aria-modal="true" aria-labelledby="confirmTitle">
     <h2 id="confirmTitle">Are you sure?</h2>
     <p id="confirmBody" class="confirm-body"></p>
     <div class="modal-row">
@@ -204,7 +205,7 @@
 
 <!-- ===== rename modal (trip or holiday) ===== -->
 <div id="renameModal" class="modal-backdrop">
-  <div class="modal-sheet">
+  <div class="modal-sheet" role="dialog" aria-modal="true" aria-labelledby="renameModalTitle">
     <h2 id="renameModalTitle">Rename</h2>
     <input type="text" id="renameInput" />
     <div class="modal-row">
@@ -216,7 +217,7 @@
 
 <!-- ===== photo moment sheet ===== -->
 <div id="momentSheet" class="modal-backdrop">
-  <div class="modal-sheet">
+  <div class="modal-sheet" role="dialog" aria-modal="true" aria-labelledby="momentSheetTitle">
     <h2 id="momentSheetTitle">Moment</h2>
     <div id="momentGrid" class="moment-grid"></div>
     <div class="modal-row">
@@ -228,7 +229,7 @@
 
 <!-- ===== end-of-story summary ===== -->
 <div id="summaryOverlay" class="modal-backdrop summary-overlay">
-  <div class="modal-sheet summary-sheet">
+  <div class="modal-sheet summary-sheet" role="dialog" aria-modal="true" aria-labelledby="summaryTitle">
     <div class="summary-glyph">&#9737;</div>
     <h2 id="summaryTitle">Trip</h2>
     <div id="summaryRoute" class="summary-route"></div>
@@ -242,7 +243,7 @@
 
 <!-- ===== photo lightbox ===== -->
 <div id="photoLightbox" class="modal-backdrop">
-  <div class="modal-sheet lightbox-sheet">
+  <div class="modal-sheet lightbox-sheet" role="dialog" aria-modal="true" aria-label="Photo">
     <img id="lightboxImg" alt="Trip photo" />
     <div id="lightboxMeta" class="lightbox-meta"></div>
     <div class="modal-row">

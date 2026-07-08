@@ -539,6 +539,8 @@ function updateScrubberValue(sim) {
     const f = s.end > s.start ? Math.max(0, Math.min(1, (sim - s.start) / (s.end - s.start))) : sim >= s.end ? 1 : 0;
     s.fill.style.width = f * 100 + '%';
   }
+  const pct = playState.maxMs > 0 ? Math.round((sim / playState.maxMs) * 100) : 0;
+  document.getElementById('storyScrubber').setAttribute('aria-valuenow', String(pct));
 }
 
 function simFromScrubberX(clientX) {
@@ -662,7 +664,9 @@ function renderFrame(simTime) {
         if (l.synthEnd <= simTime && l !== leg) hudDist += l.distance;
       }
     }
-    setTextIfChanged('readoutClock', fmtClock(pos.realTs ?? pos.ts));
+    const clock = fmtClock(pos.realTs ?? pos.ts);
+    setTextIfChanged('readoutClock', clock);
+    document.getElementById('storyScrubber').setAttribute('aria-valuetext', clock);
     setTextIfChanged('readoutDist', fmtDistance(hudDist));
     setTextIfChanged('readoutSpeed', ev || !pts ? '—' : fmtSpeed(computeSpeedKmh(pts, pos.realTs ?? pos.ts)));
     updatePaceBadge(simTime);
@@ -1002,22 +1006,37 @@ export function initPlayback() {
     if (e.target === e.currentTarget) hideSummary();
   });
 
-  document.getElementById('playToggle').addEventListener('click', () => {
+  const togglePlay = () => {
     if (playState.playing) pausePlayback();
     else { playState.lastFrameReal = performance.now(); startPlayback(); }
+  };
+  document.getElementById('playToggle').addEventListener('click', togglePlay);
+
+  // Space toggles play while watching — but never when typing in a field or with a modal
+  // (rename, confirm, moment sheet) open, and only in the ride-along, not the overview.
+  document.addEventListener('keydown', (e) => {
+    if (e.key !== ' ' && e.key !== 'Spacebar') return;
+    if (!document.getElementById('view-playback').classList.contains('active')) return;
+    if (playbackMode !== 'playing') return;
+    if (document.querySelector('.modal-backdrop.active')) return;
+    const t = e.target;
+    if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return;
+    e.preventDefault();
+    togglePlay();
   });
 
   const scrubEl = document.getElementById('storyScrubber');
   let scrubbing = false;
-  const doScrub = (e) => {
+  const seekTo = (sim) => {
     pausePlayback();
     dismissPhotoMemory();
-    map.stop();
+    if (map) map.stop();
     followEnabled = true;
-    playState.simTime = Math.max(0, Math.min(simFromScrubberX(e.clientX), playState.maxMs));
+    playState.simTime = Math.max(0, Math.min(sim, playState.maxMs));
     rearmMemoriesAfter(playState.simTime);
     renderFrame(playState.simTime);
   };
+  const doScrub = (e) => seekTo(simFromScrubberX(e.clientX));
   scrubEl.addEventListener('pointerdown', (e) => {
     scrubbing = true;
     scrubEl.setPointerCapture(e.pointerId);
@@ -1025,6 +1044,19 @@ export function initPlayback() {
   });
   scrubEl.addEventListener('pointermove', (e) => { if (scrubbing) doScrub(e); });
   scrubEl.addEventListener('pointerup', () => { scrubbing = false; });
+
+  // Keyboard seeking: arrows ±2 % (Shift ±10 %), Home/End to the ends.
+  scrubEl.addEventListener('keydown', (e) => {
+    const step = playState.maxMs * (e.shiftKey ? 0.10 : 0.02);
+    let sim = playState.simTime;
+    if (e.key === 'ArrowRight' || e.key === 'ArrowUp') sim += step;
+    else if (e.key === 'ArrowLeft' || e.key === 'ArrowDown') sim -= step;
+    else if (e.key === 'Home') sim = 0;
+    else if (e.key === 'End') sim = playState.maxMs;
+    else return;
+    e.preventDefault();
+    seekTo(sim);
+  });
 
   document.getElementById('photoMemory').addEventListener('click', () => {
     const active = memoryActive;
