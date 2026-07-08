@@ -24,7 +24,7 @@ Boot: `index.html` (all views as static divs) → `app.js` (one-line shim) →
 | Module | Role | Key exports |
 |---|---|---|
 | `src/main.js` | boot + "···" menu sheet wiring | `initApp` |
-| `src/views.js` | the entire "router" + shared UI utils | `showView:2`, `openModal:12`, `setLoading:20`, `showToast:27`, `setTextIfChanged:35` |
+| `src/views.js` | history-backed "router" + shared UI utils + in-theme dialogs | `showView`, `openModal`, `closeModal`, `registerViewGuard`, `registerViewExit`, `uiConfirm`, `uiAlert`, `setLoading`, `showToast`, `setTextIfChanged` |
 | `src/db.js` | promise-wrapped IndexedDB; one cached connection, dropped on `versionchange`/`close` | `dbPutStore`, `dbGetAllStore`, `dbGetStore`, `dbDeleteStore`, trip sugar at end of file |
 | `src/geo.js` | pure geodesy/interpolation, no side effects | `haversine:3`, `lowerBoundIdx:27`, `pointAtSimTime:37`, `interpolateByRealTs:57`, `nearestTrackPoint:69`, `downsampleByDistance:78` |
 | `src/format.js` | pure display formatters | `fmtDistance`, `fmtDuration`, …, `escapeHtml:45` (the app's only XSS guard) |
@@ -40,13 +40,19 @@ Boot: `index.html` (all views as static divs) → `app.js` (one-line shim) →
 | `src/exif.js` | minimal hand-rolled EXIF parser (first 128 KB only, `exif.js:10`) | `readExifGps:3`, `parseExif:14` |
 | `src/import-google.js` | Google Timeline.json import flow | `initImport:241`; parses `rawSignals`/`semanticSegments` only |
 | `src/backup.js` | export/restore one JSON file, non-destructive union restore | `exportBackup:27`, `restoreBackup:56` |
+| `src/gpx.js` | GPX 1.1 export of raw recorded points (trip or holiday) | `downloadGpx`, `buildGpx` |
 | `sw.js` | network-first SW, hand-listed shell precache | — |
 | `legacy/` | the pre-rewrite monolith, kept runnable, same DB | — |
 
-Navigation truth: there is **no URL routing** — no pushState/hashchange anywhere. Views
-are toggled divs; back buttons are wired per-view; the browser/OS back button exits the
-app (ROADMAP A1 addresses this). View state (open trip, etc.) lives in module-level
-variables.
+Navigation (§ updated for A1): views are still toggled divs, but `views.js` now mirrors a
+linear nav stack into the History API. `showView`/`openModal` push a `{depth}` entry;
+one `popstate` handler unwinds. UI back buttons call `history.back()`, so the OS/browser
+back button and on-screen back converge on one path. Views may register a **guard** (veto
+or ask-first, e.g. record's discard confirm; playback's playing→overview step) and an
+**exit** handler (teardown when the view actually leaves). Guards that must confirm return
+a `{confirm, onConfirm}` descriptor so `views.js` opens the in-theme dialog in the correct
+history order. There is still no *URL* routing (no paths/hashes); view state (open trip,
+etc.) lives in module-level variables.
 
 ## Data model
 
@@ -245,15 +251,13 @@ commit.
 
 ## Known fragilities
 
-Each row names the fix that addresses it (see [ROADMAP.md](ROADMAP.md)). Phase 0
-(items 0.1–0.6) shipped: GPS errors banner on the record view, screen wake lock,
-accuracy gating, the Timeline `Math.min` spread crash, the cached DB connection, and the
-CI shell-list guard (`.github/workflows/shell-guard.yml`).
+Each row names the fix that addresses it (see [ROADMAP.md](ROADMAP.md)). Shipped so far:
+Phase 0 (0.1–0.6), plus A1 (history-API back navigation — see § Navigation below),
+A2 (in-theme `uiConfirm`/`uiAlert` dialogs replace every native `alert`/`confirm`), and
+B1 (GPX export from the playback topbar, `src/gpx.js`).
 
 | Where | Symptom | Fix |
 |---|---|---|
-| `src/views.js` (absent) | no history integration — OS back exits the app | A1 |
-| various | native `alert`/`confirm` puncture the UI | A2 |
 | modals, scrubber | no dialog semantics/focus trap; scrubber pointer-only | A3 |
 | `src/playback.js:181-185` | alignment refresh reopens the whole view | A4 |
 | `src/backup.js:31-45` | whole DB base64'd into one in-memory string; OOM on big libraries | B2 |
