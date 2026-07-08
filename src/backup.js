@@ -28,21 +28,37 @@ export async function exportBackup() {
   const [trips, collections, photos, places] = await Promise.all([
     dbGetAllStore('trips'), dbGetAllStore('collections'), dbGetAllStore('photos'), dbGetAllStore('places'),
   ]);
-  const photosOut = [];
-  for (const p of photos) {
-    const { blob, ...rest } = p;
-    photosOut.push({ ...rest, blobType: blob && blob.type, blobB64: blob ? await blobToBase64(blob) : null });
+
+  // Assemble the file as an array of Blob parts, streaming photos one at a time, rather
+  // than JSON.stringify-ing the whole dataset into a single string. A few hundred
+  // base64'd photos is hundreds of MB; one contiguous string of that size trips V8's
+  // string-length ceiling and OOMs a mobile tab — exactly when the backup matters most.
+  // The on-disk shape is byte-identical to v1 ({app,version,trips,collections,photos,
+  // places}), so restore is unchanged and BACKUP_VERSION stays 1 (photos serialised last
+  // only so we can stream them; JSON object order is irrelevant to the reader).
+  const parts = [
+    '{"app":"waypoint"' +
+    `,"version":${BACKUP_VERSION}` +
+    `,"exportedAt":${JSON.stringify(new Date().toISOString())}` +
+    `,"trips":${JSON.stringify(trips)}` +
+    `,"collections":${JSON.stringify(collections)}` +
+    `,"places":${JSON.stringify(places)}` +
+    ',"photos":[',
+  ];
+
+  const many = photos.length > 50;
+  for (let i = 0; i < photos.length; i++) {
+    const { blob, ...rest } = photos[i];
+    // encode → stringify → push → release: never more than one photo's base64 alive
+    const encoded = { ...rest, blobType: blob && blob.type, blobB64: blob ? await blobToBase64(blob) : null };
+    parts.push((i ? ',' : '') + JSON.stringify(encoded));
+    if (many && (i % 25 === 0 || i === photos.length - 1)) {
+      showToast(`Packing photo ${i + 1}/${photos.length}…`, 60000);
+    }
   }
-  const payload = {
-    app: 'waypoint',
-    version: BACKUP_VERSION,
-    exportedAt: new Date().toISOString(),
-    trips,
-    collections,
-    photos: photosOut,
-    places,
-  };
-  const blob = new Blob([JSON.stringify(payload)], { type: 'application/json' });
+  parts.push(']}');
+
+  const blob = new Blob(parts, { type: 'application/json' });
   const a = document.createElement('a');
   a.href = URL.createObjectURL(blob);
   a.download = `waypoint-backup-${new Date().toISOString().slice(0, 10)}.json`;
@@ -50,7 +66,7 @@ export async function exportBackup() {
   a.click();
   a.remove();
   setTimeout(() => URL.revokeObjectURL(a.href), 30000);
-  showToast(`Backup exported: ${trips.length} trip${trips.length === 1 ? '' : 's'}, ${photosOut.length} photo${photosOut.length === 1 ? '' : 's'}.`, 4200);
+  showToast(`Backup exported: ${trips.length} trip${trips.length === 1 ? '' : 's'}, ${photos.length} photo${photos.length === 1 ? '' : 's'}.`, 4200);
 }
 
 export async function restoreBackup(file) {
@@ -65,6 +81,9 @@ export async function restoreBackup(file) {
     await uiAlert({ title: 'Not a Waypoint backup', body: 'That file doesn’t look like a Waypoint backup.' });
     return;
   }
+  // Restore must read every version ever shipped, forever. v1 and the v2 streaming export
+  // share an identical on-disk shape, so one key-by-key union handles both; if a future
+  // version changes the shape, branch on data.version here — never drop an old path.
   let trips = 0, photos = 0;
   for (const t of data.trips) {
     if (t && t.id && Array.isArray(t.points)) { await dbPutStore('trips', t); trips++; }
