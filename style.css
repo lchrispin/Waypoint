@@ -828,3 +828,38 @@ button:focus-visible { outline: 2px solid var(--amber); outline-offset: 2px; }
 @media (prefers-reduced-motion: reduce) {
   * { transition: none !important; animation: none !important; }
 }
+
+/* ---------- desktop & tablet (A5) ----------
+ * Strictly additive: every rule lives inside this breakpoint, so the phone layout below
+ * 900px is untouched. The app stays mobile-first; wide screens just stop stretching. */
+@media (min-width: 900px) {
+  /* centre the scrolling column on home, the import forms, and candidate lists */
+  .topbar { max-width: 860px; margin-left: auto; margin-right: auto; width: 100%; }
+  .content { max-width: 860px; margin-left: auto; margin-right: auto; }
+
+  /* home cards read better as a two-column grid than one tall stretch */
+  #tripList { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; align-items: start; }
+  #holidayList { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; align-items: start; }
+  #tripList:empty, #holidayList:empty { display: none; }
+
+  .fab { right: calc(50% - 430px + 20px); }
+  .select-actions { max-width: 860px; left: 50%; transform: translateX(-50%); }
+
+  /* playback: map goes full-bleed, the player becomes a floating card bottom-centre */
+  .playback-panel {
+    position: absolute;
+    left: 50%;
+    bottom: 24px;
+    transform: translateX(-50%);
+    width: min(600px, calc(100% - 48px));
+    border: 1px solid var(--line);
+    border-radius: 16px;
+    box-shadow: var(--shadow);
+    padding-bottom: 16px;
+  }
+
+  /* modals become centred cards instead of bottom sheets */
+  .modal-backdrop { align-items: center; }
+  .modal-sheet { max-width: 480px; margin: 0 auto; border-radius: 20px; }
+  .lightbox-sheet { max-width: 720px; }
+}
