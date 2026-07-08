@@ -52,10 +52,8 @@ function navigateHome() {
     const n = stack.length;
     while (stack.length) {
       const top = stack.pop();
-      if (top.type === 'modal') {
-        closeModalRaw(top.name);
-        if (top.name === 'confirmSheet') settleDialog(false);
-      } else if (exits[top.name]) exits[top.name]();
+      if (top.type === 'modal') dismissModalEntry(top);
+      else if (exits[top.name]) exits[top.name]();
     }
     suppressPops += 1; // history.go fires a single popstate no matter the distance
     history.go(-n);
@@ -66,22 +64,61 @@ function navigateHome() {
 function openModalRaw(id) { document.getElementById(id).classList.add('active'); }
 function closeModalRaw(id) { document.getElementById(id).classList.remove('active'); }
 
+const FOCUSABLE = 'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])';
+function focusablesIn(sheet) {
+  return [...sheet.querySelectorAll(FOCUSABLE)].filter((el) => !el.disabled && el.offsetParent !== null);
+}
+function topModalEntry() {
+  const top = stack[stack.length - 1];
+  return top && top.type === 'modal' ? top : null;
+}
+
+/* Remove a modal from the stack: hide it, cancel any pending dialog, and restore focus to
+ * whatever was focused when it opened — so keyboard users aren't dropped at the page top. */
+function dismissModalEntry(entry) {
+  closeModalRaw(entry.name);
+  if (entry.name === 'confirmSheet') settleDialog(false);
+  if (entry.returnFocus && document.contains(entry.returnFocus)) {
+    try { entry.returnFocus.focus(); } catch { /* element may be gone */ }
+  }
+}
+
 export function openModal(id) {
   if (stack.some((en) => en.type === 'modal' && en.name === id)) return; // already open
-  stack.push({ type: 'modal', name: id });
+  const entry = { type: 'modal', name: id, returnFocus: document.activeElement };
+  stack.push(entry);
   history.pushState({ depth: stack.length }, '');
   openModalRaw(id);
+  const first = focusablesIn(document.getElementById(id))[0];
+  if (first) first.focus();
 }
 
 export function closeModal(id) {
-  closeModalRaw(id);
   const top = stack[stack.length - 1];
   if (top && top.type === 'modal' && top.name === id) {
     stack.pop();
+    dismissModalEntry(top);
     suppressPops += 1;
     history.back();
+  } else {
+    closeModalRaw(id); // not the top entry (or not tracked) — just hide it
   }
 }
+
+// Modal keyboard semantics: Escape closes the top modal (routes through history.back so
+// the dialog/settle/focus paths all run); Tab is trapped within the open sheet.
+document.addEventListener('keydown', (e) => {
+  const top = topModalEntry();
+  if (!top) return;
+  if (e.key === 'Escape') { e.preventDefault(); history.back(); return; }
+  if (e.key === 'Tab') {
+    const items = focusablesIn(document.getElementById(top.name));
+    if (items.length === 0) return;
+    const first = items[0], last = items[items.length - 1];
+    if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+    else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+  }
+});
 
 let bypassGuardOnce = false; // set when an async guard has already approved this one leave
 
@@ -98,8 +135,7 @@ window.addEventListener('popstate', (e) => {
     const top = stack[stack.length - 1];
     if (top.type === 'modal') {
       stack.pop();
-      closeModalRaw(top.name);
-      if (top.name === 'confirmSheet') settleDialog(false); // back cancels an open dialog
+      dismissModalEntry(top); // hides, cancels any dialog, restores focus
       continue;
     }
     if (!bypassGuardOnce && guards[top.name]) {
@@ -156,16 +192,19 @@ function settleDialog(val) {
 function wireDialog() {
   if (dialogWired) return;
   dialogWired = true;
+  // settle BEFORE closeModal: closeModal → dismissModalEntry also settles(false) for the
+  // confirm sheet (the cancel-on-dismiss path), so the real answer must land first or it
+  // gets clobbered. Once settled, dialogResolve is null and the later settle is a no-op.
   document.getElementById('confirmOkBtn').addEventListener('click', () => {
-    closeModal('confirmSheet');
     settleDialog(true);
+    closeModal('confirmSheet');
   });
   document.getElementById('confirmCancelBtn').addEventListener('click', () => {
-    closeModal('confirmSheet');
     settleDialog(false);
+    closeModal('confirmSheet');
   });
   document.getElementById('confirmSheet').addEventListener('click', (e) => {
-    if (e.target === e.currentTarget) { closeModal('confirmSheet'); settleDialog(false); }
+    if (e.target === e.currentTarget) { settleDialog(false); closeModal('confirmSheet'); }
   });
 }
 
